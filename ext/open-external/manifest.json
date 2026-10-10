@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "webapp-kit link router",
+  "version": "0.0.2",
+  "description": "Opens every clicked link in the system default browser via the webapp-kit native host. Loaded unpacked by webapp-launch-chrome into isolated webapp windows.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjtseYJoTpOeS1Z7f1Lq3h7+XY3qFfnH9ZJ9/uW8OlqiI+2HNT891+fSfG9dCWp9bFb5Skkuihy5XdaXEyMpP6MK6u0Wb5W7IsYLkkGo1b5XyIYMZ4FO1fypk87Io2HidQgELt1zpqcJETZF26xRaXpG4mNTEdcQNKtnhWEE5yZv68cJ8FtqaTtan75TEPn0vB6X66iJuSLa4hJrU83VPJYgbjPUKwc9UhgMdOhYZSOiBp+qoBAH7n/w2Nt43hN0SYyNb11xHMgq8NlvqmSBMEsxBGVLtDTqKUSR9bKwf+jExITH06qgAonmtNdFj/lu1NHJ9z+e/rrgqXp6BVjyWFwIDAQAB",
+  "permissions": ["nativeMessaging"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    }
+  ]
+}

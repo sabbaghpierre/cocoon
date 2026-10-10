@@ -35,6 +35,8 @@ Re-running the installer upgrades in place; your apps, profiles, and logins are 
 ```sh
 webapp-create "Strafe" https://strafe.com firefox   # interactive if args omitted
 webapp-create "ChatGPT" https://chatgpt.com chrome
+webapp-create "YT" https://youtube.com --browser vivaldi-stable
+webapp-browsers                                    # browsers you can pin per app
 webapp-list                                          # installed apps
 webapp-doctor Strafe                                 # health check (icon, profile, CSS, rules…)
 webapp-doctor --probe Strafe                         # live window identity (icon debugging)
@@ -50,6 +52,8 @@ Apps appear in any freedesktop app launcher (Kickoff/KRunner, fuzzel, wofi, …)
 ## How it works
 
 - `webapp-create` fetches the favicon, installs it into the hicolor icon theme, and writes `~/.local/share/applications/<Name>.desktop` with an absolute `Exec=` (immune to session-PATH issues), a matching `StartupWMClass`, and — on Plasma — a KWin window rule forcing the association.
+- Each app is pinned to the browser you picked (`--browser "..."` in the `Exec=` line, chosen from `webapp-browsers`: Chrome, Vivaldi, Ungoogled Chromium, Brave, Edge, Firefox, LibreWolf, Zen, Floorp, …). Apps created before pinning use the first-found binary of their engine.
+- Chrome-engine apps route every clicked link to your system default browser (link-router extension + `webapp-open-external` native host via `xdg-open`), so e.g. a Chrome-backed WhatsApp app sends links to your default Firefox. Firefox-engine apps keep clicks in-app (Mozilla add-on signing blocks the router there).
 - Chrome apps get `--user-data-dir=~/.local/share/webapps/chrome-<slug>` + `--ozone-platform-hint=auto`.
 - Firefox apps get `--profile ~/.local/share/webapps/firefox-<slug> --no-remote`, native Wayland forced, `--name` app_id, and a `userChrome.css` that strips everything but window controls.
 
@@ -62,8 +66,9 @@ No package-manager calls, no hardcoded paths or usernames, no distro-specific as
 ```
 VERSION     install.sh  README.md  LICENSE
 bin/        webapp-{create,launch-chrome,launch-firefox,remove,list,doctor,help}
-            webapp-{update,uninstall}  (lifecycle)
+            webapp-{browsers,open-external,update,uninstall}  (browsers: detector; open-external: link-router native host)
             webapp-kwin.sh webapp-env.sh  (sourced helpers, not run directly)
+ext/        open-external/  (link-router WebExtension loaded into chrome apps)
 tool/       version.sh  (single entry point for versioning)
 tui/        nocterm terminal UI (shipped prebuilt; needs Dart SDK only to build)
 ```

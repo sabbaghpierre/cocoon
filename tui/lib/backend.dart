@@ -71,14 +71,33 @@ class Backend {
     required String name,
     required String url,
     required String engine,
+    String? browser,
     String? icon,
   }) async {
     final args = ['--name', name, '--url', url, '--engine', engine];
+    if (browser != null && browser.trim().isNotEmpty) {
+      args.addAll(['--browser', browser.trim()]);
+    }
     if (icon != null && icon.trim().isNotEmpty) {
       args.addAll(['--icon', icon.trim()]);
     }
     final r = await _guarded('webapp-create', args);
     return CommandResult(ok: r.exitCode == 0, output: _text(r));
+  }
+
+  /// Detected browsers (`webapp-browsers --json`), natively-installable
+  /// first. Throws [BackendException] when the toolkit is too old (no
+  /// `webapp-browsers` on PATH) or the output is unparseable.
+  Future<List<Browser>> listBrowsers() async {
+    final r = await _guarded('webapp-browsers', const ['--json']);
+    if (r.exitCode != 0) {
+      throw BackendException('webapp-browsers failed:\n${_text(r)}');
+    }
+    try {
+      return parseBrowserList(r.stdout as String);
+    } on FormatException catch (e) {
+      throw BackendException('could not parse webapp-browsers output: $e');
+    }
   }
 
   Future<CommandResult> removeApps(List<String> names,

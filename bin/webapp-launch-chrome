@@ -4,8 +4,12 @@
 # engine with a per-app --user-data-dir (isolated cookies/logins) instead of
 # following the xdg default browser (which breaks on Firefox-only systems).
 #
+# The concrete binary is pinned per-app via --browser (written by
+# webapp-create from `webapp-browsers` detection). Omitting --browser keeps
+# the legacy first-found behavior so pre-pinning .desktop files keep working.
+#
 # Usage:
-#   webapp-launch-chrome --name "My App" --url "https://example.com" [-- extra-chrome-flags...]
+#   webapp-launch-chrome --name "My App" --url "https://example.com" [--browser vivaldi-stable] [-- extra-chrome-flags...]
 #   webapp-launch-chrome "https://example.com" [extra-chrome-flags...]
 #   A trailing URL-like positional (e.g. %u from a MimeType handler) overrides --url.
 set -euo pipefail
@@ -26,10 +30,12 @@ cmd_version() {
 
 NAME=""
 URL=""
+BROWSER=""
 EXTRA=()
 
 usage() {
-  echo "Usage: webapp-launch-chrome --name \"My App\" --url \"https://example.com\" [-- extra-chrome-flags...]"
+  echo "Usage: webapp-launch-chrome --name \"My App\" --url \"https://example.com\" [--browser <id>] [-- extra-chrome-flags...]"
+  echo "       webapp-browsers --list   # show valid --browser ids"
 }
 
 slugify() {
@@ -45,6 +51,7 @@ while (($# > 0)); do
   case "$1" in
     --name) NAME="${2:?--name needs a value}"; shift 2 ;;
     --url) URL="${2:?--url needs a value}"; shift 2 ;;
+    --browser | --browser-bin) BROWSER="${2:?--browser needs a value}"; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
     --) shift; while (($# > 0)); do EXTRA+=("$1"); shift; done; break ;;
@@ -82,12 +89,48 @@ if [[ -z "$NAME" ]]; then
 fi
 SLUG="$(slugify "$NAME")"
 
+# Browser detection: single source of truth lives in webapp-browsers
+# (sourced for its candidate tables when present; hardcoded fallback keeps
+# old installs working when the helper is missing).
+BROWSERS_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webapp-browsers"
+if [[ -f "$BROWSERS_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$BROWSERS_HELPER" 2>/dev/null || true
+fi
+
 CHROME_BIN=""
-for c in google-chrome-stable google-chrome chromium chromium-browser brave-browser brave vivaldi-stable vivaldi microsoft-edge-stable opera; do
-  if command -v "$c" >/dev/null 2>&1; then CHROME_BIN="$c"; break; fi
-done
+if [[ -n "$BROWSER" ]]; then
+  # Refuse an obvious engine mismatch early (a Gecko binary here would fail
+  # obscurely on --app). Best effort: only when the helper identified it.
+  if declare -F webapp_browser_engine >/dev/null 2>&1; then
+    _beng="$(webapp_browser_engine "$BROWSER" || true)"
+    if [[ -n "$_beng" && "$_beng" != "chromium" ]]; then
+      echo "webapp-launch-chrome: browser '$BROWSER' is a firefox-engine binary; use webapp-launch-firefox for it" >&2
+      exit 1
+    fi
+  fi
+  if command -v "$BROWSER" >/dev/null 2>&1; then
+    CHROME_BIN="$BROWSER"
+  else
+    echo "webapp-launch-chrome: pinned browser '$BROWSER' not found on PATH" >&2
+    echo "  Run 'webapp-browsers' to list installed browsers, then recreate the app" >&2
+    echo "  (or edit its .desktop Exec line) with an available --browser." >&2
+    exit 1
+  fi
+else
+  if declare -F webapp_default_browser >/dev/null 2>&1; then
+    CHROME_BIN="$(webapp_default_browser chromium)"
+  else
+    # Fallback only for old installs lacking webapp-browsers; kept in sync
+    # with its candidate table (the real source of truth).
+    for c in google-chrome-stable google-chrome chromium chromium-browser brave-browser brave vivaldi-stable vivaldi microsoft-edge-stable opera; do
+      if command -v "$c" >/dev/null 2>&1; then CHROME_BIN="$c"; break; fi
+    done
+  fi
+fi
 if [[ -z "$CHROME_BIN" ]]; then
   echo "webapp-launch-chrome: no Chromium-based browser found (tried google-chrome-stable, chromium, brave, vivaldi, edge, opera)" >&2
+  echo "  Run 'webapp-browsers' to see what is detected." >&2
   exit 1
 fi
 
@@ -95,12 +138,104 @@ DATA_DIR="$HOME/.local/share/webapps/chrome-${SLUG}"
 mkdir -p "$DATA_DIR"
 
 LOG_FILE="$HOME/.local/share/webapps/${SLUG}.log"
-printf '[%s] launch name=%s slug=%s url=%s datadir=%s extra=%s\n' \
-  "$(date '+%F %T')" "$NAME" "$SLUG" "$URL" "$DATA_DIR" "${EXTRA[*]:-}" >>"$LOG_FILE" 2>/dev/null || true
-printf '[%s] exec: %s --ozone-platform-hint=auto --user-data-dir=%s --class=%s --app=%s %s\n' \
-  "$(date '+%F %T')" "$CHROME_BIN" "$DATA_DIR" "$SLUG" "$URL" "${EXTRA[*]:-}" >>"$LOG_FILE" 2>/dev/null || true
+# Keep per-app logs bounded (append-only otherwise). Keep last ~500 lines.
+_webapp_log_rotate() { # $1=file [max_bytes=262144]
+  local f="$1" max="${2:-262144}" sz
+  [[ -f "$f" ]] || return 0
+  sz="$(wc -c <"$f" 2>/dev/null || printf 0)"
+  [[ "$sz" =~ ^[0-9]+$ ]] || return 0
+  ((sz > max)) || return 0
+  if tail -n 500 "$f" >"$f.rot" 2>/dev/null && mv -f "$f.rot" "$f" 2>/dev/null; then
+    :
+  else
+    : >"$f" 2>/dev/null || true
+  fi
+}
+log() {
+  _webapp_log_rotate "$LOG_FILE"
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+# ---- link router: every link clicked inside the webapp window opens in the
+# system default browser (xdg-open) instead of navigating the isolated
+# profile. Companion extension (ext/open-external) + native host
+# (webapp-open-external). Best effort: a missing ext dir or a user-supplied
+# --load-extension simply disables routing (links behave as before).
+LINKOUT_EXT_ID="cjgedlnnaammogkjppnnnigoliekaegb"
+LINKOUT_HOST_NAME="com.webappkit.open_external"
+LINKOUT_FLAGS=()
+ensure_link_router() {
+  LINKOUT_FLAGS=()
+  local launcher_dir ext_dir
+  launcher_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  ext_dir=""
+  for cand in "$launcher_dir/../ext/open-external" "$HOME/.local/share/webapps/ext/open-external"; do
+    if [[ -f "$cand/manifest.json" && -f "$cand/content.js" && -f "$cand/inject.js" && -f "$cand/background.js" ]]; then
+      ext_dir="$cand"
+      break
+    fi
+  done
+  if [[ -z "$ext_dir" ]]; then
+    log "link-router: ext dir missing (re-run install.sh); links stay in-app"
+    return 0
+  fi
+  if [[ "${EXTRA[*]:-}" == *"load-extension"* ]]; then
+    log "link-router: user passes --load-extension; skipping ours"
+    return 0
+  fi
+  local host_bin="$launcher_dir/webapp-open-external"
+  [[ -x "$host_bin" ]] || host_bin="$HOME/.local/share/webapps/bin/webapp-open-external"
+  if [[ ! -x "$host_bin" ]]; then
+    log "link-router: webapp-open-external missing; links stay in-app"
+    return 0
+  fi
+  # Native-host manifest: one per Chromium config dir. Scoped to browsers we
+  # actually detect (plus the one being launched) so we don't litter config
+  # dirs of absent browsers. The manifest only activates for our extension id.
+  # Falls back to the full known list when detection yields nothing (custom or
+  # unlisted binary) so link-out never silently breaks. cmp-guarded to avoid
+  # mtime churn.
+  local cfgdirs=() cfg
+  if declare -F webapp_browsers_native_rows >/dev/null 2>&1 && declare -F webapp_browser_config_dir >/dev/null 2>&1; then
+    while IFS=$'\t' read -r _id _eng _bin _name _ver; do
+      [[ -z "$_id" ]] && continue
+      cfg="$(webapp_browser_config_dir "$_id")"
+      [[ -n "$cfg" ]] && cfgdirs+=("$cfg")
+    done < <(webapp_browsers_native_rows chromium)
+    cfg="$(webapp_browser_config_dir "$CHROME_BIN")"
+    [[ -n "$cfg" ]] && cfgdirs+=("$cfg")
+  fi
+  if ((${#cfgdirs[@]} == 0)); then
+    cfgdirs=(google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera)
+  fi
+  local manifest dest
+  manifest="$(printf '{"name":"%s","description":"webapp-kit: open webapp links in the default browser","path":"%s","type":"stdio","allowed_origins":["chrome-extension://%s/"]}' \
+    "$LINKOUT_HOST_NAME" "$host_bin" "$LINKOUT_EXT_ID")"
+  # Dedup (a browser can appear from both detection and the pinned binary)
+  # via a delimited string to stay free of associative-array requirements.
+  local _seen=" "
+  for cfgdir in "${cfgdirs[@]}"; do
+    [[ "$_seen" == *"|$cfgdir|"* ]] && continue
+    _seen="$_seen|$cfgdir|"
+    dest="$HOME/.config/$cfgdir/NativeMessagingHosts/$LINKOUT_HOST_NAME.json"
+    if [[ ! -f "$dest" ]] || ! cmp -s <(printf '%s' "$manifest") "$dest" 2>/dev/null; then
+      mkdir -p "$(dirname "$dest")" 2>/dev/null || continue
+      printf '%s' "$manifest" >"$dest" 2>/dev/null || continue
+      log "link-router: registered native host in $cfgdir"
+    fi
+  done
+  LINKOUT_FLAGS=("--disable-extensions-except=$ext_dir" "--load-extension=$ext_dir")
+  log "link-router: active (ext=$ext_dir)"
+}
+ensure_link_router
+
+printf '[%s] launch name=%s slug=%s url=%s browser=%s datadir=%s linkout=%s extra=%s\n' \
+  "$(date '+%F %T')" "$NAME" "$SLUG" "$URL" "$CHROME_BIN" "$DATA_DIR" "$([ ${#LINKOUT_FLAGS[@]} -gt 0 ] && echo on || echo off)" "${EXTRA[*]:-}" >>"$LOG_FILE" 2>/dev/null || true
+printf '[%s] exec: %s --ozone-platform-hint=auto --user-data-dir=%s --class=%s --app=%s %s %s\n' \
+  "$(date '+%F %T')" "$CHROME_BIN" "$DATA_DIR" "$SLUG" "$URL" "${LINKOUT_FLAGS[*]:-}" "${EXTRA[*]:-}" >>"$LOG_FILE" 2>/dev/null || true
 
 # --ozone-platform-hint=auto: run native Wayland under Plasma instead of
 # XWayland (XWayland webapp windows can't match .desktop icons: KDE #358277).
 # No-op on X11 sessions.
-exec setsid "$CHROME_BIN" --ozone-platform-hint=auto --user-data-dir="$DATA_DIR" --class="$SLUG" --app="$URL" "${EXTRA[@]}"
+# LINKOUT_FLAGS: link-router extension (all clicks -> default browser).
+exec setsid "$CHROME_BIN" --ozone-platform-hint=auto --user-data-dir="$DATA_DIR" --class="$SLUG" "${LINKOUT_FLAGS[@]+"${LINKOUT_FLAGS[@]}"}" --app="$URL" "${EXTRA[@]}"

@@ -15,6 +15,12 @@ const _doctorJson = '''
 "orphans":["/home/u/.local/share/webapps/firefox-Orphaned"],"issue_count":2}
 ''';
 
+const _browsersJson = '''
+[{"id":"vivaldi-stable","engine":"chromium","bin":"vivaldi-stable","name":"Vivaldi","version":"Vivaldi 7.1","source":"path","supported":true},
+ {"id":"librewolf","engine":"firefox","bin":"librewolf","name":"LibreWolf","version":"LibreWolf 140","source":"path","supported":true},
+ {"id":"firefox","engine":"firefox","bin":"flatpak run org.mozilla.firefox","name":"Firefox (flatpak)","version":"","source":"flatpak","supported":false}]
+''';
+
 void main() {
   group('parseAppList', () {
     test('parses apps incl. quoted names', () {
@@ -59,6 +65,31 @@ void main() {
     });
   });
 
+  group('parseBrowserList', () {
+    test('parses browsers incl. flatpak list-only rows', () {
+      final browsers = parseBrowserList(_browsersJson);
+      expect(browsers, hasLength(3));
+      expect(browsers[0].id, 'vivaldi-stable');
+      expect(browsers[0].engine, 'chromium');
+      expect(browsers[0].label, contains('[chromium]'));
+      expect(browsers[2].supported, isFalse);
+    });
+
+    test('supportedBrowsers drops flatpak and empty ids', () {
+      final usable = supportedBrowsers(parseBrowserList(_browsersJson));
+      expect(usable.map((b) => b.id), ['vivaldi-stable', 'librewolf']);
+    });
+
+    test('empty array', () {
+      expect(parseBrowserList('[]'), isEmpty);
+    });
+
+    test('invalid json throws', () {
+      expect(() => parseBrowserList('nope'), throwsFormatException);
+      expect(() => parseBrowserList('{}'), throwsFormatException);
+    });
+  });
+
   group('parseProbeLine', () {
     test('kwin sample', () {
       final s = parseProbeLine(
@@ -89,6 +120,7 @@ void main() {
       if (exe == 'webapp-create') return ProcessResult(0, 0, 'Created X', '');
       if (exe == 'webapp-remove') return ProcessResult(0, 1, '', 'boom');
       if (exe == 'webapp-doctor') return ProcessResult(0, 1, _doctorJson, '');
+      if (exe == 'webapp-browsers') return ProcessResult(0, 0, _browsersJson, '');
       throw UnimplementedError(exe);
     }
 
@@ -123,6 +155,37 @@ void main() {
           name: 'N', url: 'https://e.com', engine: 'chrome', icon: '/tmp/i.png');
       expect(seenArgs!.last, '/tmp/i.png');
       expect(seenArgs, contains('--icon'));
+    });
+
+    test('createApp with browser passes --browser after --engine', () async {
+      List<String>? seenArgs;
+      final b = Backend(run: (exe, args) async {
+        seenArgs = args;
+        return ProcessResult(0, 0, '', '');
+      });
+      await b.createApp(
+          name: 'N',
+          url: 'https://e.com',
+          engine: 'chrome',
+          browser: 'vivaldi-stable');
+      expect(
+          seenArgs,
+          [
+            '--name',
+            'N',
+            '--url',
+            'https://e.com',
+            '--engine',
+            'chrome',
+            '--browser',
+            'vivaldi-stable'
+          ]);
+    });
+
+    test('listBrowsers maps json', () async {
+      final browsers = await Backend(run: fakeRun).listBrowsers();
+      expect(browsers.map((b) => b.id),
+          ['vivaldi-stable', 'librewolf', 'firefox']);
     });
 
     test('removeApps ok reflects exit code', () async {

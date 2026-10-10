@@ -162,7 +162,7 @@ else
         fi
       done < <(grep -o '"path": *"[^"]*"' "$TMPDIR_WK/tree.json" 2>/dev/null |
         sed 's/"path": *"//;s/"$//' |
-        grep -E '^(bin/webapp-[^"]+|VERSION)$' || true)
+        grep -E '^(bin/webapp-[^"]+|ext/[^"]+|VERSION)$' || true)
       if [[ "$TREE_OK" == "true" && -f "$TMPDIR_WK/raw/bin/webapp-create" ]]; then
         SRC="$TMPDIR_WK/raw"
       else
@@ -192,8 +192,12 @@ if [[ "$PREFIX" != "$HOME/.local/share/webapps" ]]; then
 fi
 
 if [[ "$UNINSTALL" == "true" ]]; then
-  rm -rf "$BIN_DST"
+  rm -rf "$BIN_DST" "$PREFIX/ext"
   rm -f "$PREFIX/VERSION"
+  # Link-router native-host manifests (exact filename, ours only).
+  for _cfg in google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera; do
+    rm -f "$HOME/.config/$_cfg/NativeMessagingHosts/com.webappkit.open_external.json"
+  done
   # Remove exactly our PATH lines (current prefix or default location).
   for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
     [[ -f "$rc" ]] || continue
@@ -201,6 +205,22 @@ if [[ "$UNINSTALL" == "true" ]]; then
     cat "$rc.webapp-tmp" >"$rc"
     rm -f "$rc.webapp-tmp"
   done
+  # Fish config: same treatment (its lines carry the bare path, no colon).
+  # Our block carries explicit start/end markers so removal takes the whole
+  # `if...end` (leaving a bare `end` behind would be a fish syntax error).
+  FISH_CONF="$HOME/.config/fish/config.fish"
+  if [[ -f "$FISH_CONF" ]]; then
+    if grep -q '^# webapp-kit' "$FISH_CONF" && grep -q '^# /webapp-kit$' "$FISH_CONF"; then
+      sed "/^# webapp-kit/,/^# \/webapp-kit$/d" "$FISH_CONF" >"$FISH_CONF.webapp-tmp" || true
+    else
+      grep -v -F -e "$BIN_DST" "$FISH_CONF" >"$FISH_CONF.webapp-tmp" || true
+    fi
+    cat "$FISH_CONF.webapp-tmp" >"$FISH_CONF"
+    rm -f "$FISH_CONF.webapp-tmp"
+    # Drop the file if nothing but blank lines remain (a blank file is
+    # contentless by definition, so this cannot eat user config).
+    if ! grep -q '[^[:space:]]' "$FISH_CONF" 2>/dev/null; then rm -f "$FISH_CONF"; fi
+  fi
   rm -f "$HOME/.config/plasma-workspace/env/local-bin-path.sh"
   echo "Uninstalled webapp-kit code ($BIN_DST)."
   echo "Kept your data: profiles/desktops/icons/rules. For a full wipe:"
@@ -211,6 +231,13 @@ fi
 mkdir -p "$BIN_DST"
 cp -f "$SRC"/bin/webapp-* "$BIN_DST/"
 chmod +x "$BIN_DST"/webapp-*
+# Link-router extension (loaded by webapp-launch-chrome via --load-extension;
+# all in-webapp clicks -> system default browser). Code like bin/.
+if [[ -d "$SRC/ext" ]]; then
+  rm -rf "$PREFIX/ext"
+  cp -rf "$SRC/ext" "$PREFIX/ext"
+  chmod -R a+rX "$PREFIX/ext"
+fi
 if [[ -f "$SRC/VERSION" ]]; then
   cp -f "$SRC/VERSION" "$PREFIX/VERSION"
 fi
@@ -234,6 +261,19 @@ if [[ "$NO_PATH" != "true" ]]; then
       printf '\n# webapp-kit\n%s\n' "$PATH_LINE" >>"$rc"
     fi
   done
+  # Fish uses its own syntax (config.fish); the export line above is a
+  # syntax error there, so it gets a dedicated block. Only touched when
+  # fish is relevant (installed, login shell, or existing config) — never
+  # create fish config for non-fish users. Explicit set -gx (not
+  # fish_add_path) so uninstall can clean up by file edit alone.
+  FISH_CONF="$HOME/.config/fish/config.fish"
+  if command -v fish >/dev/null 2>&1 || [[ "${SHELL:-}" == *fish* ]] || [[ -f "$FISH_CONF" ]]; then
+    mkdir -p "$(dirname "$FISH_CONF")"
+    touch "$FISH_CONF"
+    if ! grep -q -F -e "$BIN_DST" -e "webapps/bin" "$FISH_CONF"; then
+      printf '\n# webapp-kit: managed by install.sh\nif not contains -- "%s" $PATH\n    set -gx PATH "%s" $PATH\nend\n# /webapp-kit\n' "$BIN_DST" "$BIN_DST" >>"$FISH_CONF"
+    fi
+  fi
   # Plasma graphical sessions don't source rc files; wire PATH there too,
   # but only when Plasma is actually present.
   if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* || "${XDG_CURRENT_DESKTOP:-}" == *lasma* ]] ||
@@ -256,4 +296,8 @@ fi
 echo ""
 echo "Quickstart:  webapp-create \"ChatGPT\" https://chatgpt.com chrome"
 echo "Overview:    webapp-help"
-echo "(Open a new terminal so the PATH update takes effect.)"
+if [[ "${SHELL:-}" == *fish* ]]; then
+  echo "(Run 'exec fish' or open a new terminal so the PATH update takes effect.)"
+else
+  echo "(Open a new terminal so the PATH update takes effect.)"
+fi

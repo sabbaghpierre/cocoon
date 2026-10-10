@@ -86,11 +86,29 @@ purge_isolated_data() { # $1=app name
     echo "  purged Firefox data: $DATA_ROOT/firefox-${slug}"
     removed=1
   fi
+  # Future-proof: any other per-app dir pinned to this slug (<browser>-<slug>).
+  local d
+  for d in "$DATA_ROOT"/*-"${slug}"; do
+    [[ -d "$d" ]] || continue
+    [[ "$d" == "$DATA_ROOT/chrome-${slug}" || "$d" == "$DATA_ROOT/firefox-${slug}" ]] && continue
+    rm -rf "$d"
+    echo "  purged browser data: $d"
+    removed=1
+  done
   # Per-app run log.
   rm -f "$DATA_ROOT/${slug}.log"
   if [[ "$removed" == "0" ]]; then
     echo "  (no isolated data found)"
   fi
+}
+
+# has_isolated_data <slug> — true when any per-app dir exists for the slug.
+has_isolated_data() {
+  local slug="$1" d
+  for d in "$DATA_ROOT"/*-"${slug}"; do
+    [[ -d "$d" ]] && return 0
+  done
+  return 1
 }
 
 if ((${#NAMES[@]} == 0)); then
@@ -139,7 +157,7 @@ for APP_NAME in "${NAMES[@]}"; do
   fi
   if [[ "$PURGE" == "true" ]]; then
     purge_isolated_data "$APP_NAME" "$SLUG"
-  elif [[ -t 0 ]] && { [[ -d "$DATA_ROOT/chrome-${SLUG}" ]] || [[ -d "$DATA_ROOT/firefox-${SLUG}" ]]; }; then
+  elif [[ -t 0 ]] && has_isolated_data "$SLUG"; then
     # Interactive runs ask; non-interactive keeps data (use --purge to force).
     answer=""
     if has_gum; then

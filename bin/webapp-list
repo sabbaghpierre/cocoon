@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # webapp-list — list installed isolated webapps.
 # Usage: webapp-list [-h|--help] [--json]
-#   --json emits [{"name","engine","url","desktop"}] for machine consumers.
+#   --json emits [{"name","engine","browser","url","desktop"}] for machine consumers.
 set -euo pipefail
 
 # Never inherit a hostile field separator/glob config.
@@ -40,7 +40,7 @@ json_escape() {
 
 first=true
 found=0
-if [[ "$JSON" == "true" ]]; then printf '['; else printf '%-24s %-8s %s\n' "NAME" "ENGINE" "URL"; fi
+if [[ "$JSON" == "true" ]]; then printf '['; else printf '%-24s %-8s %-18s %s\n' "NAME" "ENGINE" "BROWSER" "URL"; fi
 while IFS= read -r -d '' file; do
   exec_line="$(grep -m1 '^Exec=' "$file" || true)"
   [[ "$exec_line" == *"webapp-launch-"* ]] || continue
@@ -48,6 +48,7 @@ while IFS= read -r -d '' file; do
   engine="custom"
   [[ "$exec_line" == *"webapp-launch-chrome"* ]] && engine="chrome"
   [[ "$exec_line" == *"webapp-launch-firefox"* ]] && engine="firefox"
+  browser="$(printf '%s' "$exec_line" | sed -n 's/.*--browser[ "]*\([^ "]*\).*/\1/p' | head -n1 || true)"
   url="$(printf '%s' "$exec_line" | sed -n 's/.*--url[ "]*\([^ "]*\).*/\1/p')"
   if [[ -z "$url" ]]; then
     url="$(printf '%s' "$exec_line" | grep -oE 'https?://[^ "]*' | head -n1 || true)"
@@ -58,10 +59,10 @@ while IFS= read -r -d '' file; do
   if [[ "$JSON" == "true" ]]; then
     $first || printf ','
     first=false
-    printf '{"name":"%s","engine":"%s","url":"%s","desktop":"%s"}' \
-      "$(json_escape "$name")" "$engine" "$(json_escape "$url")" "$(json_escape "$file")"
+    printf '{"name":"%s","engine":"%s","browser":"%s","url":"%s","desktop":"%s"}' \
+      "$(json_escape "$name")" "$engine" "$(json_escape "$browser")" "$(json_escape "$url")" "$(json_escape "$file")"
   else
-    printf '%-24s %-8s %s\n' "$name" "$engine" "$url"
+    printf '%-24s %-8s %-18s %s\n' "$name" "$engine" "${browser:--}" "$url"
   fi
   found=1
 done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)

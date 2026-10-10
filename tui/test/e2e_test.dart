@@ -50,6 +50,10 @@ void main() {
         "#!/usr/bin/env bash\necho \"stub-remove \$*\" >> \"\$STUB_CALLS\"\necho Removed\n");
     File('$stubPath/webapp-doctor').writeAsStringSync(
         "#!/usr/bin/env bash\nif [[ \"\$1\" == \"--json\" ]]; then echo '{\"apps\":[],\"orphans\":[],\"issue_count\":0}'; exit 0; fi\nif [[ \"\$1\" == \"--probe\" ]]; then echo \"  class=E2EApp desktop=E2EApp pid=1 caption=X\"; sleep 0.2; echo \"probe: done\"; fi\n");
+    // Empty browser list: create wizard uses the legacy engine toggle,
+    // independent of whatever browsers the host machine has installed.
+    File('$stubPath/webapp-browsers').writeAsStringSync(
+        "#!/usr/bin/env bash\necho '[]'\n");
     for (final f in stubDir.listSync()) {
       Process.runSync('chmod', ['+x', f.path]);
     }

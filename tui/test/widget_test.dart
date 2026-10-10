@@ -127,6 +127,54 @@ void main() {
       });
     });
 
+    test('browser picker submits pinned browser', () async {
+      await testNocterm('create with browsers', (tester) async {
+        const browsersJson =
+            '[{"id":"vivaldi-stable","engine":"chromium","bin":"vivaldi-stable","name":"Vivaldi","version":"7.1","source":"path","supported":true},{"id":"firefox","engine":"firefox","bin":"firefox","name":"Firefox","version":"155","source":"path","supported":true}]';
+        final seenCreate = <String>[];
+        Future<ProcessResult> run(String exe, List<String> args) async {
+          if (exe == 'webapp-browsers') {
+            return ProcessResult(0, 0, browsersJson, '');
+          }
+          if (exe == 'webapp-create') {
+            seenCreate.addAll(args);
+            return ProcessResult(0, 0, 'Created via stub', '');
+          }
+          throw UnimplementedError(exe);
+        }
+
+        await tester.pumpComponent(CreateScreen(
+          backend: Backend(run: run),
+          onBack: () {},
+        ));
+        await tester.enterText('MyApp');
+        await tester.sendEnter();
+        await tester.enterText('https://e.com');
+        await tester.sendEnter();
+        await tester.pump();
+        expect(tester.terminalState, containsText('vivaldi-stable'));
+        // move to Firefox, confirm
+        await tester.sendKey(LogicalKey.arrowDown);
+        await tester.sendEnter();
+        await tester.sendEnter(); // empty icon -> confirm
+        expect(tester.terminalState, containsText('firefox'));
+        await tester.sendKeyEvent(charKey('y', LogicalKey.keyY));
+        await tester.pump();
+        expect(
+            seenCreate,
+            [
+              '--name',
+              'MyApp',
+              '--url',
+              'https://e.com',
+              '--engine',
+              'firefox',
+              '--browser',
+              'firefox'
+            ]);
+      });
+    });
+
     test('empty name blocks advance', () async {
       await testNocterm('create validation', (tester) async {
         await tester.pumpComponent(CreateScreen(

@@ -6,6 +6,7 @@ library;
 import 'package:nocterm/nocterm.dart';
 
 import '../backend.dart';
+import '../models.dart';
 
 enum _Step { name, url, engine, icon, confirm, working, done }
 
@@ -24,10 +25,51 @@ class _CreateScreenState extends State<CreateScreen> {
   final nameCtrl = TextEditingController();
   final urlCtrl = TextEditingController();
   final iconCtrl = TextEditingController();
+  // Browser picker (from `webapp-browsers --json`). Falls back to the
+  // legacy chrome/firefox toggle when detection fails or finds nothing.
+  List<Browser> browsers = const [];
+  int browserIndex = 0;
+  bool browsersLoading = true;
   bool engineIsChrome = true;
   String? error;
   String? result;
   bool resultOk = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadBrowsers();
+  }
+
+  Future<void> _loadBrowsers() async {
+    try {
+      final all = await component.backend.listBrowsers();
+      if (!mounted) return;
+      final usable = supportedBrowsers(all);
+      setState(() {
+        browsers = usable;
+        browserIndex = 0;
+        browsersLoading = false;
+      });
+    } catch (_) {
+      // Old toolkit without webapp-browsers, detection failure, or test
+      // fakes that don't stub it: fall back to the legacy engine toggle.
+      if (!mounted) return;
+      setState(() => browsersLoading = false);
+    }
+  }
+
+  bool get _useBrowserList => browsers.isNotEmpty;
+
+  String get _engine =>
+      _useBrowserList ? (_pickedEngine) : (engineIsChrome ? 'chrome' : 'firefox');
+
+  String get _pickedEngine {
+    final b = browsers[browserIndex];
+    return b.engine == 'chromium' ? 'chrome' : 'firefox';
+  }
+
+  String? get _pickedBrowser => _useBrowserList ? browsers[browserIndex].id : null;
 
   static const _order = [_Step.name, _Step.url, _Step.engine, _Step.icon];
 
@@ -76,7 +118,8 @@ class _CreateScreenState extends State<CreateScreen> {
       final r = await component.backend.createApp(
         name: nameCtrl.text.trim(),
         url: urlCtrl.text.trim(),
-        engine: engineIsChrome ? 'chrome' : 'firefox',
+        engine: _engine,
+        browser: _pickedBrowser,
         icon: iconCtrl.text.trim().isEmpty ? null : iconCtrl.text.trim(),
       );
       if (!mounted) return;
@@ -108,16 +151,31 @@ class _CreateScreenState extends State<CreateScreen> {
       return true;
     }
     if (step == _Step.engine) {
-      if (event.logicalKey == LogicalKey.arrowUp ||
-          event.logicalKey == LogicalKey.arrowDown) {
-        setState(() => engineIsChrome = !engineIsChrome);
+      if (event.logicalKey == LogicalKey.arrowUp) {
+        setState(() {
+          if (_useBrowserList) {
+            browserIndex = (browserIndex - 1 + browsers.length) % browsers.length;
+          } else {
+            engineIsChrome = !engineIsChrome;
+          }
+        });
+        return true;
+      }
+      if (event.logicalKey == LogicalKey.arrowDown) {
+        setState(() {
+          if (_useBrowserList) {
+            browserIndex = (browserIndex + 1) % browsers.length;
+          } else {
+            engineIsChrome = !engineIsChrome;
+          }
+        });
         return true;
       }
       if (event.logicalKey == LogicalKey.enter) {
         _next();
         return true;
       }
-      if (event.character == 'e') {
+      if (event.character == 'e' && !_useBrowserList) {
         setState(() => engineIsChrome = !engineIsChrome);
         return true;
       }
@@ -199,6 +257,21 @@ class _CreateScreenState extends State<CreateScreen> {
           onSubmitted: (_) => _next(),
         );
       case _Step.engine:
+        if (browsersLoading) {
+          return const Text('Detecting installed browsers…');
+        }
+        if (_useBrowserList) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              for (var i = 0; i < browsers.length; i++)
+                _engineRow(browsers[i].label, i == browserIndex),
+              const SizedBox(height: 1),
+              const Text('up/down: select · Enter: confirm',
+                  style: TextStyle(color: Colors.brightBlack)),
+            ],
+          );
+        }
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -224,7 +297,7 @@ class _CreateScreenState extends State<CreateScreen> {
           children: [
             Text('Create "${nameCtrl.text.trim()}"?'),
             Text(
-                '  ${(engineIsChrome ? 'chrome' : 'firefox')} · ${urlCtrl.text.trim()}${iconCtrl.text.trim().isEmpty ? '' : ' · custom icon'}'),
+                '  ${_pickedBrowser ?? _engine} · ${urlCtrl.text.trim()}${iconCtrl.text.trim().isEmpty ? '' : ' · custom icon'}'),
             const SizedBox(height: 1),
             const Text('y/Enter: create · n/Esc: back'),
           ],

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# webapp-open-external — native-messaging host for the link-router extension.
+#
+# The companion extension (ext/open-external, loaded by webapp-launch-chrome
+# via --load-extension) sends {"url": "..."} for every link activated inside
+# an isolated webapp window. This host hands the URL to the SYSTEM DEFAULT
+# browser via xdg-open, so webapp windows never absorb external navigation.
+#
+# Protocol: Chrome native messaging over stdio (4-byte LE length + JSON both
+# ways). Pure bash + coreutils (no python needed). Never emits anything
+# except framed replies on stdout; diagnostics go to a log file.
+#
+# Started by Chrome (manifest path passed as argv[1], ignored); also runnable
+# by hand for testing: printf message | webapp-open-external.
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+DATA_ROOT="$HOME/.local/share/webapps"
+LOG_FILE="$DATA_ROOT/link-router.log"
+MAX_MSG=65536 # sanity cap on one native message
+mkdir -p "$DATA_ROOT" 2>/dev/null || true
+
+# Keep the log bounded (the host is launched per message; logs are append-only
+# otherwise). Keep the last ~500 lines once over the cap.
+_webapp_log_rotate() { # $1=file [max_bytes=262144]
+  local f="$1" max="${2:-262144}" sz
+  [[ -f "$f" ]] || return 0
+  sz="$(wc -c <"$f" 2>/dev/null || printf 0)"
+  [[ "$sz" =~ ^[0-9]+$ ]] || return 0
+  ((sz > max)) || return 0
+  if tail -n 500 "$f" >"$f.rot" 2>/dev/null && mv -f "$f.rot" "$f" 2>/dev/null; then
+    :
+  else
+    : >"$f" 2>/dev/null || true
+  fi
+}
+
+log() {
+  _webapp_log_rotate "$LOG_FILE"
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+case "${1:-}" in
+  -h | --help)
+    echo "Usage: webapp-open-external   (Chrome native-messaging host; reads framed JSON on stdin)"
+    echo "Opens {\"url\"} via xdg-open (system default browser). Only http(s) URLs are honored."
+    exit 0
+    ;;
+  --version)
+    d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "$d/../VERSION" ]]; then cat "$d/../VERSION"; else printf 'dev'; fi
+    printf '\n'
+    exit 0
+    ;;
+esac
+
+OPENER=""
+if command -v xdg-open >/dev/null 2>&1; then
+  OPENER="xdg-open"
+elif command -v gio >/dev/null 2>&1; then
+  OPENER="gio open"
+fi
+
+reply() { # $1=json body — write one framed reply to stdout
+  local body="$1" len
+  len="$(printf '%s' "$body" | wc -c)"
+  # 4-byte little-endian length prefix (binary-safe via %b octal escapes).
+  printf '%b' "\\$(printf '%03o' "$((len & 255))")\\$(printf '%03o' "$(((len >> 8) & 255))")\\$(printf '%03o' "$(((len >> 16) & 255))")\\$(printf '%03o' "$(((len >> 24) & 255))")"
+  printf '%s' "$body"
+}
+
+# read_len — read 4 raw bytes from stdin, print decimal length. Fails on EOF.
+# Uses dd bs=1 (never head): head(1) may buffer and discard bytes past what
+# it prints, which would eat subsequent messages on this shared stdin.
+read_len() {
+  local nums b0 b1 b2 b3
+  nums="$(dd bs=1 count=4 2>/dev/null | od -An -tu1)" || return 1
+  [[ -n "$nums" ]] || return 1
+  # NOTE: IFS is unset globally (repo convention), so re-enable splitting
+  # just for this parse.
+  IFS=' ' read -r b0 b1 b2 b3 <<<"$nums" || true
+  [[ -n "$b0" && -n "$b1" && -n "$b2" && -n "$b3" ]] || return 1
+  printf '%d' "$((10#$b0 + 10#$b1 * 256 + 10#$b2 * 65536 + 10#$b3 * 16777216))"
+}
+
+# read_body <len> — read exactly <len> bytes from stdin (offset-safe).
+read_body() {
+  dd bs=1 "count=$1" 2>/dev/null || true
+}
+
+json_unescape_url() { # stdin -> stdout: minimal JSON string unescaping for URLs
+  sed -e 's#\\/#/#g' -e 's#\\"#"#g' -e 's#\\\\#\\#g'
+}
+
+while true; do
+  len="$(read_len)" || break # clean EOF: Chrome closed the port
+  if ((len <= 0 || len > MAX_MSG)); then
+    log "reject: bad length $len"
+    reply '{"ok":false,"error":"bad-length"}'
+    break
+  fi
+  msg="$(read_body "$len" || true)"
+  [[ -n "$msg" ]] || break
+  url="$(printf '%s' "$msg" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | json_unescape_url || true)"
+  if [[ ! "$url" =~ ^[Hh][Tt][Tt][Pp][Ss]?:// ]]; then
+    log "reject: not http(s): $(printf '%s' "$msg" | head -c 120)"
+    reply '{"ok":false,"error":"not-http"}'
+    continue
+  fi
+  if [[ -z "$OPENER" ]]; then
+    log "reject: no xdg-open/gio for $url"
+    reply '{"ok":false,"error":"no-opener"}'
+    continue
+  fi
+  # Detached: never block the reply on the browser process (xdg-open can
+  # take seconds when it cold-starts the default browser).
+  # shellcheck disable=SC2086
+  setsid $OPENER "$url" >/dev/null 2>&1 < /dev/null &
+  log "open: $url via $OPENER"
+  reply '{"ok":true}'
+done
+exit 0

@@ -115,6 +115,57 @@ DoctorReport parseDoctorReport(String text) {
   return DoctorReport.fromJson(decoded);
 }
 
+/// One installed browser (from `webapp-browsers --json`).
+class Browser {
+  final String id;
+  final String engine;
+  final String name;
+  final String version;
+  final bool supported;
+
+  const Browser({
+    required this.id,
+    required this.engine,
+    required this.name,
+    required this.version,
+    required this.supported,
+  });
+
+  factory Browser.fromJson(Map<String, dynamic> json) => Browser(
+        id: (json['id'] ?? json['bin'] ?? '').toString(),
+        engine: (json['engine'] ?? '').toString(),
+        name: (json['name'] ?? '').toString(),
+        version: (json['version'] ?? '').toString(),
+        supported: json['supported'] != false,
+      );
+
+  /// Label for picker rows, e.g. "Vivaldi (vivaldi-stable) [chromium] 7.1".
+  String get label {
+    final v = version.trim().isEmpty ? '' : ' $version'.trimRight();
+    return '$name ($id) [$engine]$v';
+  }
+
+  @override
+  String toString() => 'Browser($id, $engine)';
+}
+
+/// Parse `webapp-browsers --json` (a top-level JSON array).
+/// Flatpak list-only rows (supported=false) are kept — callers filter.
+List<Browser> parseBrowserList(String text) {
+  final decoded = jsonDecode(text);
+  if (decoded is! List) {
+    throw FormatException('expected JSON array, got: $text');
+  }
+  return decoded
+      .whereType<Map<String, dynamic>>()
+      .map(Browser.fromJson)
+      .toList();
+}
+
+/// Only browsers that can actually back a webapp (native installs).
+List<Browser> supportedBrowsers(List<Browser> browsers) =>
+    browsers.where((b) => b.supported && b.id.isNotEmpty).toList();
+
 /// Mirror of the bash slugify() in webapp-* (spaces to dashes, keep
 /// alnum/dash/underscore/dot, collapse + trim dashes). Used for probe
 /// MATCH highlighting only.

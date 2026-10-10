@@ -6,12 +6,17 @@
 # Isolation model (like ice-ssb, whose Firefox SSBs are ALWAYS isolated):
 #   firefox --profile ~/.local/share/webapps/firefox-<slug> --no-remote <url>
 # The profile dir is app-owned: no profiles.ini bookkeeping, rm -rf purges it.
+# Any Gecko binary works here (firefox, firefox-esr, librewolf, zen-browser,
+# floorp, waterfox): same profile flags, same user.js/userChrome.css layout.
+# The concrete binary is pinned per-app via --browser (written by
+# webapp-create from `webapp-browsers` detection); omitting it means plain
+# `firefox` so pre-pinning .desktop files keep working.
 #
 # Wayland identity: --name sets the Wayland app_id, which must equal the slug
 # (and StartupWMClass in the .desktop). --class covers X11/XWayland.
 #
 # Usage:
-#   webapp-launch-firefox --name "My App" --url "https://example.com"
+#   webapp-launch-firefox --name "My App" --url "https://example.com" [--browser librewolf]
 #   webapp-launch-firefox "https://example.com"
 #   A trailing URL-like positional (e.g. %u from a MimeType handler) overrides --url.
 set -euo pipefail
@@ -32,10 +37,13 @@ cmd_version() {
 
 NAME=""
 URL=""
+BROWSER="firefox"
+BROWSER_PINNED=false
 EXTRA=()
 
 usage() {
-  echo "Usage: webapp-launch-firefox --name \"My App\" --url \"https://example.com\""
+  echo "Usage: webapp-launch-firefox --name \"My App\" --url \"https://example.com\" [--browser <id>]"
+  echo "       webapp-browsers --list   # show valid --browser ids"
 }
 
 slugify() {
@@ -51,6 +59,7 @@ while (($# > 0)); do
   case "$1" in
     --name) NAME="${2:?--name needs a value}"; shift 2 ;;
     --url) URL="${2:?--url needs a value}"; shift 2 ;;
+    --browser | --browser-bin) BROWSER="${2:?--browser needs a value}"; BROWSER_PINNED=true; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
     --) shift; while (($# > 0)); do EXTRA+=("$1"); shift; done; break ;;
@@ -86,8 +95,32 @@ if [[ -z "$NAME" ]]; then
 fi
 SLUG="$(slugify "$NAME")"
 
-if ! command -v firefox >/dev/null 2>&1; then
-  echo "webapp-launch-firefox: firefox not found on PATH" >&2
+BROWSERS_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webapp-browsers"
+if [[ -f "$BROWSERS_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$BROWSERS_HELPER" 2>/dev/null || true
+fi
+# Refuse an obvious engine mismatch early (a Chromium binary here would fail
+# obscurely on --profile). Best effort: only when the helper identified it.
+if declare -F webapp_browser_engine >/dev/null 2>&1; then
+  _beng="$(webapp_browser_engine "$BROWSER" || true)"
+  if [[ -n "$_beng" && "$_beng" != "firefox" ]]; then
+    echo "webapp-launch-firefox: browser '$BROWSER' is a chromium-engine binary; use webapp-launch-chrome for it" >&2
+    exit 1
+  fi
+fi
+
+if ! command -v "$BROWSER" >/dev/null 2>&1; then
+  if [[ "$BROWSER_PINNED" == "true" ]]; then
+    echo "webapp-launch-firefox: pinned browser '$BROWSER' not found on PATH" >&2
+  else
+    echo "webapp-launch-firefox: firefox not found on PATH" >&2
+  fi
+  echo "  Run 'webapp-browsers' to list installed browsers." >&2
+  if [[ "$BROWSER" == "librewolf" ]]; then
+    echo "  Note: LibreWolf clears cookies/history aggressively by default;" >&2
+    echo "  an isolated webapp may forget logins unless you relax that." >&2
+  fi
   exit 1
 fi
 
@@ -95,12 +128,26 @@ DATA_ROOT="$HOME/.local/share/webapps"
 PDIR="$DATA_ROOT/firefox-${SLUG}"
 LOG_FILE="$DATA_ROOT/${SLUG}.log"
 
+# Keep per-app logs bounded (append-only otherwise). Keep last ~500 lines.
+_webapp_log_rotate() { # $1=file [max_bytes=262144]
+  local f="$1" max="${2:-262144}" sz
+  [[ -f "$f" ]] || return 0
+  sz="$(wc -c <"$f" 2>/dev/null || printf 0)"
+  [[ "$sz" =~ ^[0-9]+$ ]] || return 0
+  ((sz > max)) || return 0
+  if tail -n 500 "$f" >"$f.rot" 2>/dev/null && mv -f "$f.rot" "$f" 2>/dev/null; then
+    :
+  else
+    : >"$f" 2>/dev/null || true
+  fi
+}
 log() {
+  _webapp_log_rotate "$LOG_FILE"
   printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
 }
 
 mkdir -p "$PDIR/chrome"
-log "launch name='$NAME' slug='$SLUG' url='$URL' profile='$PDIR' extra='${EXTRA[*]:-}'"
+log "launch name='$NAME' slug='$SLUG' url='$URL' browser='$BROWSER' profile='$PDIR' extra='${EXTRA[*]:-}'"
 
 # stylesheets pref (idempotent)
 PREF='user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);'
@@ -177,8 +224,8 @@ if command -v pgrep >/dev/null 2>&1 && pgrep -f -- "--profile $PDIR" >/dev/null 
   log "warning: profile already in use"
 fi
 
-log "exec: env MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile $PDIR --new-window --name $SLUG --class $SLUG $URL ${EXTRA[*]:-}"
+log "exec: env MOZ_ENABLE_WAYLAND=1 $BROWSER --no-remote --profile $PDIR --new-window --name $SLUG --class $SLUG $URL ${EXTRA[*]:-}"
 # --no-remote allows this profile to run alongside the default Firefox instance.
 # MOZ_ENABLE_WAYLAND=1 forces the native Wayland backend: under XWayland the
 # window can push its own (Firefox logo) icon, overriding the .desktop icon.
-exec env MOZ_ENABLE_WAYLAND=1 setsid firefox --no-remote --profile "$PDIR" --new-window --name "$SLUG" --class "$SLUG" "$URL" "${EXTRA[@]}"
+exec env MOZ_ENABLE_WAYLAND=1 setsid "$BROWSER" --no-remote --profile "$PDIR" --new-window --name "$SLUG" --class "$SLUG" "$URL" "${EXTRA[@]}"

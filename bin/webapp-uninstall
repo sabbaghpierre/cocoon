@@ -76,6 +76,7 @@ fi
 
 echo "webapp-uninstall will remove the webapp-kit toolkit:"
 echo "  - code:            $BIN_DST"
+echo "  - link-router ext: $PREFIX/ext (+ its browser native-host manifests)"
 echo "  - shell PATH lines pointing at it"
 echo "  - Plasma session PATH file (if ours)"
 if [[ "$PURGE" == "true" ]]; then
@@ -113,9 +114,14 @@ if [[ "$PURGE" == "true" && -x "$BIN_DST/webapp-remove" ]]; then
   done
 fi
 
-# 2. Toolkit code + version stamp.
-rm -rf "$BIN_DST"
+# 2. Toolkit code + version stamp + link-router extension.
+rm -rf "$BIN_DST" "$PREFIX/ext"
 rm -f "$PREFIX/VERSION"
+
+# 2b. Link-router native-host manifests (exact filename, ours only).
+for _cfg in google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera; do
+  rm -f "$HOME/.config/$_cfg/NativeMessagingHosts/com.webappkit.open_external.json"
+done
 
 # 3. Shell PATH lines (exactly ours).
 for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
@@ -125,6 +131,22 @@ for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
   cat "$tmp" >"$rc"
   rm -f "$tmp"
 done
+
+# 3b. Fish config (own syntax; lines carry the bare path, no colon).
+# Removal takes the whole marked block: leaving a bare `end` behind would
+# be a fish syntax error.
+FISH_CONF="$HOME/.config/fish/config.fish"
+if [[ -f "$FISH_CONF" ]]; then
+  tmp="$(mktemp)"
+  if grep -q '^# webapp-kit' "$FISH_CONF" && grep -q '^# /webapp-kit$' "$FISH_CONF"; then
+    sed "/^# webapp-kit/,/^# \/webapp-kit$/d" "$FISH_CONF" >"$tmp" || true
+  else
+    grep -v -F -e "$BIN_DST" "$FISH_CONF" >"$tmp" || true
+  fi
+  cat "$tmp" >"$FISH_CONF"
+  rm -f "$tmp"
+  if ! grep -q '[^[:space:]]' "$FISH_CONF" 2>/dev/null; then rm -f "$FISH_CONF"; fi
+fi
 
 # 4. Plasma session PATH file (only if it is ours).
 ENV_FILE="$HOME/.config/plasma-workspace/env/local-bin-path.sh"

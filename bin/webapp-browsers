@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# webapp-browsers — detect installed browsers for isolated webapps.
+#
+# Single source of truth for browser detection. Every other webapp-* script
+# should source this file (for the candidate tables + helpers) or call it
+# as a CLI (for human / TUI consumption) instead of hardcoding binary names.
+#
+# Detection model:
+#   engine chromium = any binary speaking Chromium SSB flags
+#     (--app --user-data-dir --class). Backs webapp-launch-chrome.
+#   engine firefox  = any Gecko binary speaking Firefox profile flags
+#     (--profile --no-remote --new-window --name --class) + user.js /
+#     chrome/userChrome.css isolation. Backs webapp-launch-firefox.
+#     (LibreWolf / Zen / Floorp / Waterfox are full Gecko builds, so they
+#     are fully supported — same flags, same profile layout. Tor Browser
+#     is deliberately excluded: its sandbox fights --profile reuse.)
+#   Flatpak browsers are LIST-ONLY in v1 (reported with source=flatpak,
+#   supported=false): launchers exec native binaries directly, while
+#   Flatpak needs `flatpak run` + sandbox binds (a separate project).
+#
+# Usage:
+#   webapp-browsers                  # human table (native + flatpak-only note)
+#   webapp-browsers --json           # [{"id","engine","bin","name","version","source","supported"}]
+#   webapp-browsers --list           # plain ids, one per line (native only)
+#   webapp-browsers --engine chromium|firefox [--json|--list]
+#   webapp-browsers --all            # include flatpak-only rows in --list too
+#   webapp-browsers --default chromium|firefox  # print default binary id or empty
+#   Sourcing: source webapp-browsers (functions only, no output; safe to
+#   source twice). Uses webapp_browser_* namespace to avoid collisions.
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+_webapp_browsers_cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+# ---- candidate tables (ordered: first found = default) ----
+_WEBAPP_CHROMIUM_CANDIDATES=(
+  google-chrome-stable google-chrome google-chrome-beta google-chrome-unstable
+  chromium chromium-browser ungoogled-chromium
+  brave-browser brave brave-beta
+  vivaldi-stable vivaldi vivaldi-snapshot
+  microsoft-edge-stable microsoft-edge microsoft-edge-beta
+  opera opera-beta
+  thorium-browser thorium
+)
+_WEBAPP_FIREFOX_CANDIDATES=(
+  firefox firefox-esr firefox-beta firefox-developer-edition
+  librewolf zen-browser zen floorp waterfox
+)
+
+# webapp_browser_engine <id> -> chromium|firefox|""
+webapp_browser_engine() {
+  local id="$1" c
+  for c in ${_WEBAPP_CHROMIUM_CANDIDATES[@]+"${_WEBAPP_CHROMIUM_CANDIDATES[@]}"}; do
+    [[ "$c" == "$id" ]] && { printf 'chromium'; return 0; }
+  done
+  for c in ${_WEBAPP_FIREFOX_CANDIDATES[@]+"${_WEBAPP_FIREFOX_CANDIDATES[@]}"}; do
+    [[ "$c" == "$id" ]] && { printf 'firefox'; return 0; }
+  done
+  printf ''
+  return 1
+}
+
+# webapp_browser_known <id> -> true if in either table
+webapp_browser_known() {
+  [[ -n "$(webapp_browser_engine "$1" || true)" ]]
+}
+
+# webapp_browser_display_name <id> -> human label
+webapp_browser_display_name() {
+  case "$1" in
+    google-chrome-stable | google-chrome) printf 'Google Chrome' ;;
+    google-chrome-beta) printf 'Google Chrome Beta' ;;
+    google-chrome-unstable) printf 'Google Chrome Unstable' ;;
+    chromium | chromium-browser) printf 'Chromium' ;;
+    ungoogled-chromium) printf 'Ungoogled Chromium' ;;
+    brave-browser | brave) printf 'Brave' ;;
+    brave-beta) printf 'Brave Beta' ;;
+    vivaldi-stable | vivaldi) printf 'Vivaldi' ;;
+    vivaldi-snapshot) printf 'Vivaldi Snapshot' ;;
+    microsoft-edge-stable | microsoft-edge) printf 'Microsoft Edge' ;;
+    microsoft-edge-beta) printf 'Microsoft Edge Beta' ;;
+    opera | opera-beta) printf 'Opera' ;;
+    thorium-browser | thorium) printf 'Thorium' ;;
+    firefox) printf 'Firefox' ;;
+    firefox-esr) printf 'Firefox ESR' ;;
+    firefox-beta) printf 'Firefox Beta' ;;
+    firefox-developer-edition) printf 'Firefox Developer Edition' ;;
+    librewolf) printf 'LibreWolf' ;;
+    zen-browser | zen) printf 'Zen Browser' ;;
+    floorp) printf 'Floorp' ;;
+    waterfox) printf 'Waterfox' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# webapp_browser_config_dir <id> -> relative Chromium config dir for that
+# browser (under $HOME/.config), or empty if not a known Chromium binary.
+# Lets callers place native-messaging hosts only where the browser will look.
+webapp_browser_config_dir() {
+  case "$1" in
+    google-chrome-stable | google-chrome | google-chrome-beta | google-chrome-unstable) printf 'google-chrome' ;;
+    chromium | chromium-browser | ungoogled-chromium | thorium-browser | thorium) printf 'chromium' ;;
+    brave-browser | brave | brave-beta) printf 'BraveSoftware/Brave-Browser' ;;
+    vivaldi-stable | vivaldi | vivaldi-snapshot) printf 'vivaldi' ;;
+    microsoft-edge-stable | microsoft-edge | microsoft-edge-beta) printf 'microsoft-edge' ;;
+    opera | opera-beta) printf 'opera' ;;
+    *) printf '' ;;
+  esac
+}
+
+# webapp_browser_version <bin> -> first line of --version, or empty (never fails)
+webapp_browser_version() {
+  local bin="$1" out=""
+  if command -v "$bin" >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      out="$(timeout 5 "$bin" --version 2>/dev/null | head -n1 || true)"
+    else
+      out="$("$bin" --version 2>/dev/null | head -n1 || true)"
+    fi
+  fi
+  printf '%s' "$out"
+}
+
+# webapp_browsers_native_rows — print TAB-separated rows for PATH browsers:
+# id \t engine \t bin \t display \t version. Respects $1 engine filter or empty.
+webapp_browsers_native_rows() {
+  local filter="${1:-}" id eng ver
+  for id in ${_WEBAPP_CHROMIUM_CANDIDATES[@]+"${_WEBAPP_CHROMIUM_CANDIDATES[@]}"}; do
+    [[ -n "$filter" && "$filter" != "chromium" ]] && break
+    if command -v "$id" >/dev/null 2>&1; then
+      ver="$(webapp_browser_version "$id")"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "chromium" "$id" "$(webapp_browser_display_name "$id")" "$ver"
+    fi
+  done
+  for id in ${_WEBAPP_FIREFOX_CANDIDATES[@]+"${_WEBAPP_FIREFOX_CANDIDATES[@]}"}; do
+    [[ -n "$filter" && "$filter" != "firefox" ]] && continue
+    # NOTE: chromium loop uses break on filter mismatch (chromium block is
+    # first); firefox loop uses continue — both correct, do not "unify".
+    if command -v "$id" >/dev/null 2>&1; then
+      ver="$(webapp_browser_version "$id")"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "firefox" "$id" "$(webapp_browser_display_name "$id")" "$ver"
+    fi
+  done
+}
+
+# Map a flatpak app id to "browser-id \t engine" or empty if unknown.
+_webapp_flatpak_map() {
+  case "$1" in
+    com.google.Chrome) printf 'google-chrome-stable\tchromium' ;;
+    com.google.ChromeBeta) printf 'google-chrome-beta\tchromium' ;;
+    org.chromium.Chromium) printf 'chromium\tchromium' ;;
+    *ungoogled*chromium* | *UngoogledChromium*) printf 'ungoogled-chromium\tchromium' ;;
+    com.brave.Browser | com.brave.BrowserBeta) printf 'brave-browser\tchromium' ;;
+    com.vivaldi.Vivaldi) printf 'vivaldi-stable\tchromium' ;;
+    com.microsoft.Edge) printf 'microsoft-edge-stable\tchromium' ;;
+    com.opera.Opera) printf 'opera\tchromium' ;;
+    org.mozilla.firefox | org.mozilla.firefox_beta) printf 'firefox\tfirefox' ;;
+    io.gitlab.librewolf-community | io.gitlab.LibreWolf) printf 'librewolf\tfirefox' ;;
+    app.zen_browser.zen | io.github.zen_browser*) printf 'zen-browser\tfirefox' ;;
+    *floorp* | *Floorp*) printf 'floorp\tfirefox' ;;
+    *waterfox* | *Waterfox*) printf 'waterfox\tfirefox' ;;
+    *) return 1 ;;
+  esac
+}
+
+# webapp_browsers_flatpak_rows [filter] — TAB rows for flatpak-only browsers
+# (skips any id already on PATH): flatpak-id \t engine \t browser-id \t display.
+webapp_browsers_flatpak_rows() {
+  local filter="${1:-}"
+  command -v flatpak >/dev/null 2>&1 || return 0
+  local app mapped bid beng
+  while IFS= read -r app; do
+    [[ -z "$app" ]] && continue
+    mapped="$(_webapp_flatpak_map "$app" || true)"
+    [[ -z "$mapped" ]] && continue
+    bid="${mapped%%$'\t'*}"
+    beng="${mapped#*$'\t'}"
+    [[ -n "$filter" && "$filter" != "$beng" ]] && continue
+    # Skip when a native binary already covers it.
+    if command -v "$bid" >/dev/null 2>&1; then continue; fi
+    printf '%s\t%s\t%s\t%s\n' "$app" "$beng" "$bid" "$(webapp_browser_display_name "$bid")"
+  done < <(flatpak list --app --columns=application 2>/dev/null | tail -n +1 || true)
+}
+
+# webapp_default_browser <chromium|firefox> -> first available binary id or empty
+webapp_default_browser() {
+  local engine="${1:-}" id
+  if [[ "$engine" == "chromium" ]]; then
+    for id in ${_WEBAPP_CHROMIUM_CANDIDATES[@]+"${_WEBAPP_CHROMIUM_CANDIDATES[@]}"}; do
+      if command -v "$id" >/dev/null 2>&1; then printf '%s' "$id"; return 0; fi
+    done
+  elif [[ "$engine" == "firefox" ]]; then
+    for id in ${_WEBAPP_FIREFOX_CANDIDATES[@]+"${_WEBAPP_FIREFOX_CANDIDATES[@]}"}; do
+      if command -v "$id" >/dev/null 2>&1; then printf '%s' "$id"; return 0; fi
+    done
+  fi
+  printf ''
+}
+
+_webapp_browsers_json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
+}
+
+_webapp_browsers_usage() {
+  echo "Usage: webapp-browsers [--json|--list] [--engine chromium|firefox] [--all]"
+  echo "       webapp-browsers --default chromium|firefox"
+  echo "Lists installed browsers for isolated webapps (see webapp-help)."
+  echo "Flatpak browsers are list-only in v1 (need native package for SSB)."
+}
+
+# ---- CLI main (skipped when sourced) ----
+_webapp_browsers_main() {
+  local mode="table" filter="" include_flatpak_list=false default_engine=""
+  while (($# > 0)); do
+    case "$1" in
+      --json) mode="json"; shift ;;
+      --list) mode="list"; shift ;;
+      --engine)
+        filter="${2:?--engine needs chromium|firefox}"; shift 2
+        if [[ "$filter" != "chromium" && "$filter" != "firefox" ]]; then
+          echo "webapp-browsers: --engine must be chromium|firefox, got '$filter'" >&2
+          exit 1
+        fi
+        ;;
+      --all) include_flatpak_list=true; shift ;;
+      --default)
+        default_engine="${2:?--default needs chromium|firefox}"; shift 2
+        mode="default"
+        ;;
+      -h | --help) _webapp_browsers_usage; exit 0 ;;
+      --version) printf '%s %s\n' "$(basename "$0")" "$(_webapp_browsers_cmd_version)"; exit 0 ;;
+      --) shift; break ;;
+      -*) echo "webapp-browsers: unknown flag: $1" >&2; _webapp_browsers_usage >&2; exit 1 ;;
+      *) echo "webapp-browsers: unexpected arg: $1" >&2; _webapp_browsers_usage >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ "$mode" == "default" ]]; then
+    webapp_default_browser "$default_engine"
+    # Trailing newline only when non-empty (clean command substitution).
+    if [[ -n "$(webapp_default_browser "$default_engine")" ]]; then printf '\n'; fi
+    exit 0
+  fi
+
+  if [[ "$mode" == "json" ]]; then
+    local first=true id eng bin name ver
+    printf '['
+    while IFS=$'\t' read -r id eng bin name ver; do
+      [[ -z "$id" ]] && continue
+      $first || printf ','
+      first=false
+      printf '{"id":"%s","engine":"%s","bin":"%s","name":"%s","version":"%s","source":"%s","supported":%s}' \
+        "$(_webapp_browsers_json_escape "$id")" "$eng" \
+        "$(_webapp_browsers_json_escape "$bin")" "$(_webapp_browsers_json_escape "$name")" \
+        "$(_webapp_browsers_json_escape "$ver")" "path" "true"
+    done < <(webapp_browsers_native_rows "$filter")
+    local app feng bid fname
+    while IFS=$'\t' read -r app feng bid fname; do
+      [[ -z "$app" ]] && continue
+      $first || printf ','
+      first=false
+      printf '{"id":"%s","engine":"%s","bin":"%s","name":"%s","version":"%s","source":"%s","supported":%s}' \
+        "$(_webapp_browsers_json_escape "$bid")" "$feng" \
+        "$(_webapp_browsers_json_escape "flatpak run $app")" "$(_webapp_browsers_json_escape "$fname (flatpak)")" \
+        "" "flatpak" "false"
+    done < <(webapp_browsers_flatpak_rows "$filter")
+    printf ']\n'
+    exit 0
+  fi
+
+  if [[ "$mode" == "list" ]]; then
+    webapp_browsers_native_rows "$filter" | cut -f1
+    if [[ "$include_flatpak_list" == "true" ]]; then
+      webapp_browsers_flatpak_rows "$filter" | cut -f3
+    fi
+    exit 0
+  fi
+
+  # Human table.
+  local rows flat
+  rows="$(webapp_browsers_native_rows "$filter")"
+  if [[ -z "$rows" ]]; then
+    echo "(no native browsers found)"
+  else
+    printf '%-24s %-9s %s\n' "BROWSER" "ENGINE" "VERSION"
+    while IFS=$'\t' read -r id eng _bin name ver; do
+      [[ -z "$id" ]] && continue
+      printf '%-24s %-9s %s\n' "$id ($name)" "$eng" "$ver"
+    done <<<"$rows"
+  fi
+  flat="$(webapp_browsers_flatpak_rows "$filter")"
+  if [[ -n "$flat" ]]; then
+    echo ""
+    echo "Flatpak-only (list-only in v1 — install the native package to create webapps):"
+    while IFS=$'\t' read -r app feng bid fname; do
+      [[ -z "$app" ]] && continue
+      printf '  %-22s %-9s %s\n' "$bid ($fname)" "$feng" "$app"
+    done <<<"$flat"
+  fi
+}
+
+# Run main only when executed, not when sourced.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  _webapp_browsers_main "$@"
+fi

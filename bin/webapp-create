@@ -2,17 +2,26 @@
 # webapp-create — create an isolated webapp launcher (Omarchy-style) for Void/KDE.
 #
 # What it does (mirrors `omarchy-webapp-install`):
-#   1. Takes name + URL (+ engine + icon), prompting interactively if missing.
+#   1. Takes name + URL (+ browser/engine + icon), prompting interactively if missing.
 #   2. Fetches the site favicon automatically, else asks for a PNG icon URL.
 #   3. Writes ~/.local/share/applications/<Name>.desktop with an isolated
-#      launcher Exec (per-app Chrome data dir OR per-app Firefox profile).
+#      launcher Exec (per-app Chrome data dir OR per-app Firefox profile),
+#      pinned to the chosen browser via --browser.
 #   The app then shows up in Kickoff/KRunner like any native app.
+#
+# Browser vs engine: --engine (chrome|firefox) is the isolation technology
+# (category shorthand, back-compat); --browser is the concrete binary pinned
+# per-app (e.g. vivaldi-stable, ungoogled-chromium, librewolf, zen-browser).
+# `webapp-browsers` lists valid --browser ids. When both are given they must
+# agree; when only --browser is given the engine is inferred; when only
+# --engine is given the default browser of that family is auto-pinned.
 #
 # Usage:
 #   webapp-create                                        # fully interactive
 #   webapp-create --name "ChatGPT" --url "https://chatgpt.com" --engine chrome
+#   webapp-create --name "YT" --url https://youtube.com --browser vivaldi-stable
 #   webapp-create "ChatGPT" "https://chatgpt.com" chrome "https://.../icon.png" "x-scheme-handler/mailto"
-#   Flags: --name --url --engine(chrome|firefox) --icon(URL|file) --mime(MimeType) --exec(custom Exec)
+#   Flags: --name --url --engine(chrome|firefox) --browser(<id>) --icon(URL|file) --mime(MimeType) --exec(custom Exec)
 set -euo pipefail
 
 # Never inherit a hostile field separator/glob config (an IFS without space
@@ -37,8 +46,25 @@ APP_NAME=""
 APP_URL=""
 ICON_REF=""
 ENGINE=""
+BROWSER=""
 MIME_TYPES=""
 CUSTOM_EXEC=""
+
+# Browser detection lives in webapp-browsers (single source of truth).
+# Source it early so flag/positional parsing can validate --browser ids.
+# Fallback tables below keep old installs working when the helper is missing.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$_SCRIPT_DIR/webapp-browsers" ]]; then
+  # shellcheck disable=SC1090
+  source "$_SCRIPT_DIR/webapp-browsers" 2>/dev/null || true
+elif [[ -f "$HOME/.local/share/webapps/bin/webapp-browsers" ]]; then
+  # shellcheck disable=SC1090
+  source "$HOME/.local/share/webapps/bin/webapp-browsers" 2>/dev/null || true
+fi
+# Kept only for old installs lacking webapp-browsers; kept in sync with the
+# candidate tables there (the real source of truth).
+_FALLBACK_CHROMIUM=(google-chrome-stable google-chrome chromium chromium-browser ungoogled-chromium brave-browser brave vivaldi-stable vivaldi microsoft-edge-stable opera thorium-browser)
+_FALLBACK_FIREFOX=(firefox firefox-esr librewolf zen-browser zen floorp waterfox)
 
 usage() {
   sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'
@@ -60,6 +86,82 @@ is_engine_token() {
     chrome | chromium | firefox | ff) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# is_browser_token <tok> — true if it names a concrete browser binary.
+is_browser_token() {
+  if declare -F webapp_browser_known >/dev/null 2>&1; then
+    webapp_browser_known "$1"
+    return $?
+  fi
+  local c
+  for c in ${_FALLBACK_CHROMIUM[@]+"${_FALLBACK_CHROMIUM[@]}"} ${_FALLBACK_FIREFOX[@]+"${_FALLBACK_FIREFOX[@]}"}; do
+    [[ "$c" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# browser_engine_of <id> -> chromium|firefox|"" (helper engine vocabulary)
+browser_engine_of() {
+  if declare -F webapp_browser_engine >/dev/null 2>&1; then
+    webapp_browser_engine "$1" || true
+    return 0
+  fi
+  local c
+  for c in ${_FALLBACK_CHROMIUM[@]+"${_FALLBACK_CHROMIUM[@]}"}; do
+    [[ "$c" == "$1" ]] && { printf 'chromium'; return 0; }
+  done
+  for c in ${_FALLBACK_FIREFOX[@]+"${_FALLBACK_FIREFOX[@]}"}; do
+    [[ "$c" == "$1" ]] && { printf 'firefox'; return 0; }
+  done
+  printf ''
+}
+
+# default_browser_for <chrome|firefox> -> binary id or empty
+default_browser_for() {
+  if declare -F webapp_default_browser >/dev/null 2>&1; then
+    case "$1" in
+      chrome) webapp_default_browser chromium ;;
+      firefox) webapp_default_browser firefox ;;
+      *) printf '' ;;
+    esac
+    return 0
+  fi
+  local c list=()
+  if [[ "$1" == "chrome" ]]; then list=(${_FALLBACK_CHROMIUM[@]+"${_FALLBACK_CHROMIUM[@]}"});
+  elif [[ "$1" == "firefox" ]]; then list=(${_FALLBACK_FIREFOX[@]+"${_FALLBACK_FIREFOX[@]}"});
+  fi
+  for c in ${list[@]+"${list[@]}"}; do
+    if command -v "$c" >/dev/null 2>&1; then printf '%s' "$c"; return 0; fi
+  done
+  printf ''
+}
+
+# native_browser_rows — print TAB rows: id \t helper-engine \t display \t version
+native_browser_rows() {
+  if declare -F webapp_browsers_native_rows >/dev/null 2>&1; then
+    webapp_browsers_native_rows ""
+    return 0
+  fi
+  local id
+  for id in ${_FALLBACK_CHROMIUM[@]+"${_FALLBACK_CHROMIUM[@]}"}; do
+    if command -v "$id" >/dev/null 2>&1; then
+      printf '%s\tchromium\t%s\t%s\n' "$id" "$id" ""
+    fi
+  done
+  for id in ${_FALLBACK_FIREFOX[@]+"${_FALLBACK_FIREFOX[@]}"}; do
+    if command -v "$id" >/dev/null 2>&1; then
+      printf '%s\tfirefox\t%s\t%s\n' "$id" "$id" ""
+    fi
+  done
+}
+
+browser_display_of() {
+  if declare -F webapp_browser_display_name >/dev/null 2>&1; then
+    webapp_browser_display_name "$1"
+  else
+    printf '%s' "$1"
+  fi
 }
 
 # A MIME type (e.g. x-scheme-handler/mailto) vs a custom Exec command:
@@ -94,6 +196,7 @@ while (($# > 0)); do
     --url) APP_URL="${2:?--url needs a value}"; shift 2 ;;
     --icon) ICON_REF="${2:?--icon needs a value}"; shift 2 ;;
     --engine) ENGINE="${2:?--engine needs a value}"; shift 2 ;;
+    --browser | --browser-bin) BROWSER="${2:?--browser needs a value}"; shift 2 ;;
     --mime | --mime-types) MIME_TYPES="${2:?--mime needs a value}"; shift 2 ;;
     --exec) CUSTOM_EXEC="${2:?--exec needs a value}"; shift 2 ;;
     -h | --help) usage; exit 0 ;;
@@ -110,12 +213,14 @@ if ((${#POS[@]} > 0)) && [[ -z "$APP_NAME" ]]; then APP_NAME="${POS[0]}"; fi
 if ((${#POS[@]} > 1)) && [[ -z "$APP_URL" ]]; then APP_URL="${POS[1]}"; fi
 p3="${POS[2]:-}"; p4="${POS[3]:-}"; p5="${POS[4]:-}"; p6="${POS[5]:-}"
 if [[ -n "$p6" ]]; then echo "webapp-create: too many positional args" >&2; usage >&2; exit 1; fi
-# Engine may sit in any of slots 3-5; remaining tokens keep Omarchy order:
-# icon, custom-exec, mime-types.
+# Engine or concrete browser id may sit in any of slots 3-5; remaining
+# tokens keep Omarchy order: icon, custom-exec, mime-types.
 rest=()
 for tok in "$p3" "$p4" "$p5"; do
   [[ -n "$tok" ]] || continue
-  if is_engine_token "$tok" && [[ -z "$ENGINE" ]]; then ENGINE="$tok"; else rest+=("$tok"); fi
+  if is_engine_token "$tok" && [[ -z "$ENGINE" ]]; then ENGINE="$tok";
+  elif is_browser_token "$tok" && [[ -z "$BROWSER" ]]; then BROWSER="$tok";
+  else rest+=("$tok"); fi
 done
 if ((${#rest[@]} > 0)) && [[ -z "$ICON_REF" ]]; then ICON_REF="${rest[0]}"; fi
 if ((${#rest[@]} > 1)); then
@@ -129,7 +234,7 @@ if ((${#rest[@]} > 2)) && [[ -z "$MIME_TYPES" ]]; then MIME_TYPES="${rest[2]}"; 
 if ((${#rest[@]} > 3)); then echo "webapp-create: too many positional args" >&2; usage >&2; exit 1; fi
 
 INTERACTIVE_MODE=false
-if [[ -z "$APP_NAME" || -z "$APP_URL" || -z "$ENGINE" ]]; then INTERACTIVE_MODE=true; fi
+if [[ -z "$APP_NAME" || -z "$APP_URL" || ( -z "$ENGINE" && -z "$BROWSER" ) ]]; then INTERACTIVE_MODE=true; fi
 
 # ---- interactive prompts for anything missing ----
 if [[ -z "$APP_NAME" ]]; then
@@ -142,7 +247,58 @@ fi
 if [[ ! "$APP_URL" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]]; then
   APP_URL="https://$APP_URL"
 fi
-if [[ -z "$ENGINE" ]]; then
+# Browser picker: concrete browser list from detection. Falls back to the
+# legacy 2-option engine prompt only when no native browser is detected
+# (or the helper is missing and PATH has none of the fallback ids).
+pick_browser_interactive() {
+  local rows
+  rows="$(native_browser_rows)"
+  if [[ -z "$rows" ]]; then return 1; fi
+  local ids=() labels=() id beng disp ver
+  while IFS=$'\t' read -r id beng _bin disp ver; do
+    [[ -z "$id" ]] && continue
+    [[ -z "$disp" ]] && disp="$(browser_display_of "$id")"
+    ids+=("$id")
+    if [[ -n "$ver" ]]; then
+      labels+=("$disp ($id) [$beng] $ver")
+    else
+      labels+=("$disp ($id) [$beng]")
+    fi
+  done <<<"$rows"
+  if ((${#ids[@]} == 0)); then return 1; fi
+  if ((${#ids[@]} == 1)); then
+    BROWSER="${ids[0]}"
+    echo "Browser: $BROWSER (only one detected)" >&2
+    return 0
+  fi
+  if has_gum; then
+    local picked i
+    picked="$(gum choose --header "Browser? (isolated profile in the selected browser)" "${labels[@]}")"
+    for i in "${!ids[@]}"; do
+      if [[ "${labels[$i]}" == "$picked" ]]; then BROWSER="${ids[$i]}"; return 0; fi
+    done
+    return 1
+  else
+    echo "Browser? (isolated per-app profile in the selected browser)" >&2
+    local i
+    for i in "${!ids[@]}"; do
+      printf '  %d) %s\n' "$((i + 1))" "${labels[$i]}" >&2
+    done
+    printf 'Choice [1/%d or browser id]> ' "${#ids[@]}" >&2
+    IFS= read -r choice || choice=""
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#ids[@]})); then
+      BROWSER="${ids[$((choice - 1))]}"
+      return 0
+    fi
+    for i in "${!ids[@]}"; do
+      if [[ "${ids[$i]}" == "$choice" ]]; then BROWSER="${ids[$i]}"; return 0; fi
+    done
+    # Default: first detected.
+    BROWSER="${ids[0]}"
+    return 0
+  fi
+}
+pick_engine_legacy() {
   if has_gum; then
     ENGINE="$(gum choose --header "Engine? (chrome = --app window, firefox = minimal-UI profile)" "chrome" "firefox")"
   else
@@ -156,11 +312,42 @@ if [[ -z "$ENGINE" ]]; then
       *) ENGINE="chrome" ;;
     esac
   fi
+}
+if [[ -z "$BROWSER" && -z "$ENGINE" ]]; then
+  if ! pick_browser_interactive; then
+    pick_engine_legacy
+  fi
 fi
-ENGINE="$(normalize_engine "$ENGINE")"
-if [[ "$ENGINE" != "chrome" && "$ENGINE" != "firefox" ]]; then
-  echo "webapp-create: engine must be 'chrome' or 'firefox', got '$ENGINE'" >&2
-  exit 1
+# Normalize + reconcile engine/browser (both flags kept; they must agree).
+if [[ -n "$ENGINE" ]]; then
+  ENGINE="$(normalize_engine "$ENGINE")"
+  if [[ "$ENGINE" != "chrome" && "$ENGINE" != "firefox" ]]; then
+    echo "webapp-create: engine must be 'chrome' or 'firefox', got '$ENGINE'" >&2
+    exit 1
+  fi
+fi
+if [[ -n "$BROWSER" ]]; then
+  _beng="$(browser_engine_of "$BROWSER")"
+  if [[ -z "$_beng" ]]; then
+    echo "webapp-create: unknown browser '$BROWSER' (run 'webapp-browsers --list')" >&2
+    exit 1
+  fi
+  if ! command -v "$BROWSER" >/dev/null 2>&1; then
+    echo "webapp-create: browser '$BROWSER' not found on PATH (run 'webapp-browsers')" >&2
+    exit 1
+  fi
+  # Helper speaks chromium|firefox; ENGINE speaks chrome|firefox.
+  _want="$ENGINE"
+  [[ "$_want" == "chrome" ]] && _want="chromium"
+  if [[ -z "$ENGINE" ]]; then
+    [[ "$_beng" == "chromium" ]] && ENGINE="chrome" || ENGINE="firefox"
+  elif [[ "$_want" != "$_beng" ]]; then
+    echo "webapp-create: --browser '$BROWSER' is a $_beng browser, but --engine is '$ENGINE'" >&2
+    exit 1
+  fi
+else
+  # Engine-only path: auto-pin the default browser of that family.
+  BROWSER="$(default_browser_for "$ENGINE")"
 fi
 
 if [[ -z "$APP_NAME" || -z "$APP_URL" ]]; then
@@ -224,12 +411,21 @@ cp -f "$ICON_SRC" "$HICOLOR_DIR/$SLUG.png"
 chmod 644 "$HICOLOR_DIR/$SLUG.png"
 ICON_VALUE="$SLUG"
 
-# ---- engine sanity warnings (non-fatal) ----
-if [[ "$ENGINE" == "chrome" ]] && ! command -v google-chrome-stable >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v brave-browser >/dev/null 2>&1 && ! command -v brave >/dev/null 2>&1 && ! command -v vivaldi-stable >/dev/null 2>&1; then
+# ---- engine sanity warnings (non-fatal; BROWSER empty = nothing detected) ----
+if [[ "$ENGINE" == "chrome" && -z "$BROWSER" ]]; then
   echo "webapp-create: warning: no Chromium-based browser found; install google-chrome or chromium for the 'chrome' engine." >&2
 fi
-if [[ "$ENGINE" == "firefox" ]] && ! command -v firefox >/dev/null 2>&1; then
-  echo "webapp-create: warning: firefox not found on PATH." >&2
+if [[ "$ENGINE" == "firefox" && -z "$BROWSER" ]]; then
+  echo "webapp-create: warning: no Firefox-family browser found on PATH (run 'webapp-browsers')." >&2
+fi
+if [[ "$BROWSER" == "librewolf" ]]; then
+  echo "webapp-create: note: LibreWolf clears cookies/history aggressively by default;" >&2
+  echo "  relax that inside the webapp if logins don't stick." >&2
+fi
+if [[ "$ENGINE" == "firefox" ]]; then
+  echo "webapp-create: note: firefox-engine apps keep link clicks inside the webapp window" >&2
+  echo "  (Mozilla add-on signing blocks the link router there); pick a chromium" >&2
+  echo "  browser if you want clicks to open in your system default browser." >&2
 fi
 
 # ---- Exec line (absolute launcher path: Plasma/KRunner do NOT inherit
@@ -266,10 +462,14 @@ fi
 if [[ -n "$CUSTOM_EXEC" ]]; then
   EXEC_COMMAND="$CUSTOM_EXEC"
 else
+  # Pin the concrete browser so the app always opens in what the user picked
+  # (omitted only when nothing was detected — legacy first-found behavior).
+  _BROWSER_FLAG=""
+  [[ -n "$BROWSER" ]] && _BROWSER_FLAG=" --browser \"$BROWSER\""
   if [[ "$ENGINE" == "chrome" ]]; then
-    EXEC_COMMAND="$LAUNCHER_DIR/webapp-launch-chrome --name \"$APP_NAME\" --url \"$APP_URL\""
+    EXEC_COMMAND="$LAUNCHER_DIR/webapp-launch-chrome$_BROWSER_FLAG --name \"$APP_NAME\" --url \"$APP_URL\""
   else
-    EXEC_COMMAND="$LAUNCHER_DIR/webapp-launch-firefox --name \"$APP_NAME\" --url \"$APP_URL\""
+    EXEC_COMMAND="$LAUNCHER_DIR/webapp-launch-firefox$_BROWSER_FLAG --name \"$APP_NAME\" --url \"$APP_URL\""
   fi
   if [[ -n "$MIME_TYPES" && "$EXEC_COMMAND" != *"%u"* ]]; then
     EXEC_COMMAND="$EXEC_COMMAND %u"
@@ -277,11 +477,13 @@ else
 fi
 
 DESKTOP_FILE="$DESKTOP_DIR/$APP_NAME.desktop"
+ENGINE_LABEL="$ENGINE"
+[[ -n "$BROWSER" ]] && ENGINE_LABEL="$ENGINE ($BROWSER)"
 cat >"$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Version=1.0
 Name=$APP_NAME
-Comment=$APP_NAME (webapp, $ENGINE, isolated)
+Comment=$APP_NAME (webapp, $ENGINE_LABEL, isolated)
 Exec=$EXEC_COMMAND
 Terminal=false
 Type=Application
@@ -325,7 +527,7 @@ if [[ "$(compositor)" == "plasma" ]] && declare -F kwin_rule_add >/dev/null 2>&1
   kwin_reconfigure || true
 fi
 
-echo "Created '$APP_NAME' ($ENGINE, isolated). Find it in your app launcher."
+echo "Created '$APP_NAME' ($ENGINE_LABEL, isolated). Find it in your app launcher."
 echo "Note: isolated profile — log in once inside the webapp window."
 echo "Tip: permission popup stuck? Hover the top edge, move onto the popup,"
 echo "     click Allow once (remembered forever; ends any retry loop)."

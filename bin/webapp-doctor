@@ -44,6 +44,18 @@ if [[ -f "$ENV_HELPER" ]]; then
   source "$ENV_HELPER"
 fi
 
+# browser helpers (single source of truth for detection); optional.
+BROWSERS_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webapp-browsers"
+if [[ -f "$BROWSERS_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$BROWSERS_HELPER" 2>/dev/null || true
+fi
+
+# parse_browser <exec-line> -> pinned --browser id or empty (never fails)
+parse_browser() {
+  printf '%s' "$1" | sed -n 's/.*--browser[ "]*\([^ "]*\).*/\1/p' | head -n1 || true
+}
+
 # compositor(): plasma|niri|hyprland|sway|gnome|unknown (plasma if undetectable,
 # preserving historical behavior for old installs without the helper).
 compositor() {
@@ -76,7 +88,7 @@ check_app() {
     warn "no .desktop file ($desktop)"
     return
   fi
-  local exec_line icon wmclass engine slug url launcher
+  local exec_line icon wmclass engine slug url launcher browser
   exec_line="$(grep -m1 '^Exec=' "$desktop" | cut -d= -f2- || true)"
   icon="$(grep -m1 '^Icon=' "$desktop" | cut -d= -f2- || true)"
   wmclass="$(grep -m1 '^StartupWMClass=' "$desktop" | cut -d= -f2- || true)"
@@ -88,8 +100,43 @@ check_app() {
   slug="$(slugify "$slug")"
   url="$(printf '%s' "$exec_line" | sed -n 's/.*--url "\([^"]*\)".*/\1/p;s/.*--url \([^ "]*\).*/\1/p' | head -n1 || true)"
   launcher="$(printf '%s' "$exec_line" | awk '{print $1}')"
+  browser="$(parse_browser "$exec_line")"
 
   if [[ -x "$launcher" ]]; then ok "launcher $launcher"; else warn "launcher not executable: $launcher"; fi
+  if [[ "$engine" == "chrome" || "$engine" == "firefox" ]]; then
+    if [[ -n "$browser" ]]; then
+      if command -v "$browser" >/dev/null 2>&1; then
+        ok "browser $browser"
+      else
+        warn "pinned browser '$browser' not found on PATH (run 'webapp-browsers'; recreate or edit Exec)"
+      fi
+    else
+      info "no pinned browser (legacy app: launches with first-found $engine binary)"
+    fi
+  fi
+  # Link-out: chrome-engine clicks route to the system default browser.
+  # (Firefox engine: Mozilla requires AMO signing for release-Firefox
+  # extensions with no per-profile override, so no router can install there.)
+  if [[ "$engine" == "chrome" ]]; then
+    _lself="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    _lext=""
+    for _lcand in "$_lself/../ext/open-external" "$HOME/.local/share/webapps/ext/open-external"; do
+      if [[ -f "$_lcand/manifest.json" && -f "$_lcand/inject.js" ]]; then _lext="$_lcand"; break; fi
+    done
+    _lman=0
+    for _lcfg in google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera; do
+      [[ -f "$HOME/.config/$_lcfg/NativeMessagingHosts/com.webappkit.open_external.json" ]] && _lman=$((_lman + 1))
+    done
+    if [[ -n "$_lext" && "$_lman" -gt 0 ]]; then
+      ok "link-out on (clicks open in system default browser)"
+    elif [[ -z "$_lext" ]]; then
+      warn "link-router ext missing (re-run install.sh); clicks stay in-app"
+    else
+      info "link-out registers on next launch (native host not installed yet)"
+    fi
+  elif [[ "$engine" == "firefox" ]]; then
+    info "firefox engine keeps clicks in-app (Mozilla signing blocks the router; use a chromium browser for link-out)"
+  fi
   # Resolve icon: absolute path (legacy) or theme name (hicolor).
   icon_path="$icon"
   if [[ -n "$icon" && "$icon" != */* ]]; then
@@ -197,7 +244,8 @@ check_app_json() {
   local name="$1"
   local desktop="$DESKTOP_DIR/$name.desktop"
   local -a issues=()
-  local exec_line icon wmclass engine slug url launcher icon_path
+  local exec_line="" icon="" wmclass="" engine="custom" slug="" url="" launcher="" icon_path="" browser=""
+  local linkout=false
   local desktop_valid="" profile_dir="" css_version="n/a" kwin_rule=false live=false log_tail=""
   if [[ ! -f "$desktop" ]]; then
     issues+=("no .desktop file ($desktop)")
@@ -213,7 +261,23 @@ check_app_json() {
     slug="$(slugify "$slug")"
     url="$(printf '%s' "$exec_line" | sed -n 's/.*--url "\([^"]*\)".*/\1/p;s/.*--url \([^ "]*\).*/\1/p' | head -n1 || true)"
     launcher="$(printf '%s' "$exec_line" | awk '{print $1}')"
+    browser="$(parse_browser "$exec_line")"
     [[ -x "$launcher" ]] || issues+=("launcher not executable: $launcher")
+    if [[ ("$engine" == "chrome" || "$engine" == "firefox") && -n "$browser" ]] && ! command -v "$browser" >/dev/null 2>&1; then
+      issues+=("pinned browser '$browser' not found on PATH")
+    fi
+    linkout=false
+    if [[ "$engine" == "chrome" ]]; then      _lself="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      _lext=false; _lman=false
+      for _lcand in "$_lself/../ext/open-external" "$HOME/.local/share/webapps/ext/open-external"; do
+        if [[ -f "$_lcand/manifest.json" && -f "$_lcand/inject.js" ]]; then _lext=true; break; fi
+      done
+      for _lcfg in google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera; do
+        if [[ -f "$HOME/.config/$_lcfg/NativeMessagingHosts/com.webappkit.open_external.json" ]]; then _lman=true; break; fi
+      done
+      if [[ "$_lext" == "true" && "$_lman" == "true" ]]; then linkout=true; fi
+      if [[ "$_lext" != "true" ]]; then issues+=("link-router ext missing (re-run install.sh); clicks stay in-app"); fi
+    fi
     icon_path="$icon"
     if [[ -n "$icon" && "$icon" != */* ]]; then
       for cand in "$HOME/.local/share/icons/hicolor/128x128/apps/$icon.png" \
@@ -287,8 +351,8 @@ check_app_json() {
     issues_json="$issues_json\"$(json_escape "$it")\""
   done
   JSON_ISSUES+=(${issues[@]+"${issues[@]}"})
-  printf '{"name":"%s","engine":"%s","url":"%s","desktop":"%s","icon":"%s","icon_path":"%s","startup_wmclass":"%s","desktop_valid":%s,"profile_dir":"%s","css_version":"%s","kwin_rule":%s,"live":%s,"log_tail":"%s","issues":[%s]}' \
-    "$(json_escape "$name")" "$engine" "$(json_escape "$url")" "$(json_escape "$desktop")" \
+  printf '{"name":"%s","engine":"%s","browser":"%s","linkout":%s,"url":"%s","desktop":"%s","icon":"%s","icon_path":"%s","startup_wmclass":"%s","desktop_valid":%s,"profile_dir":"%s","css_version":"%s","kwin_rule":%s,"live":%s,"log_tail":"%s","issues":[%s]}' \
+    "$(json_escape "$name")" "$engine" "$(json_escape "$browser")" "$linkout" "$(json_escape "$url")" "$(json_escape "$desktop")" \
     "$(json_escape "$icon")" "$(json_escape "$icon_path")" "$(json_escape "$wmclass")" \
     "${desktop_valid:-null}" "$(json_escape "$profile_dir")" "$css_version" "$kwin_rule" "$live" \
     "$(json_escape "$log_tail")" "$issues_json"
@@ -471,13 +535,51 @@ deps() {
       printf '  MISSING: %s\n' "$c"; missing_hard="$missing_hard $c"
     fi
   done
-  if command -v firefox >/dev/null 2>&1; then
-    printf '  ok: firefox (%s engine)\n' "$(command -v firefox)"
-  elif command -v google-chrome-stable >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1 || command -v brave-browser >/dev/null 2>&1 || command -v brave >/dev/null 2>&1 || command -v vivaldi-stable >/dev/null 2>&1; then
-    printf '  ok: chromium-family browser (chrome engine)\n'
+  # Browsers via the webapp-browsers detector (single source of truth).
+  local _brows="" _id _eng _bin _name _ver _row
+  if declare -F webapp_browsers_native_rows >/dev/null 2>&1; then
+    _brows="$(webapp_browsers_native_rows "")"
   else
-    printf '  MISSING: no supported browser (firefox or chromium-family)\n'
+    for c in firefox google-chrome-stable google-chrome chromium chromium-browser brave-browser brave vivaldi-stable; do
+      if command -v "$c" >/dev/null 2>&1; then
+        printf -v _row '%s\t%s\t%s\t%s\t%s\n' "$c" "?" "$c" "$c" ""
+        _brows+="$_row"
+      fi
+    done
+  fi
+  if [[ -n "$_brows" ]]; then
+    while IFS=$'\t' read -r _id _eng _bin _name _ver; do
+      [[ -z "$_id" ]] && continue
+      printf '  ok: %s (%s engine)%s\n' "$_id" "$_eng" "${_ver:+ — $_ver}"
+    done <<<"$_brows"
+  else
+    printf '  MISSING: no supported browser (run webapp-browsers for details)\n'
     missing_hard="$missing_hard browser"
+  fi
+  echo "== link-out (webapp links -> system default browser) =="
+  _selfdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _extdir=""
+  for _cand in "$_selfdir/../ext/open-external" "$HOME/.local/share/webapps/ext/open-external"; do
+    if [[ -f "$_cand/manifest.json" && -f "$_cand/inject.js" ]]; then _extdir="$_cand"; break; fi
+  done
+  _manifs=0
+  for _cfg in google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera; do
+    [[ -f "$HOME/.config/$_cfg/NativeMessagingHosts/com.webappkit.open_external.json" ]] && _manifs=$((_manifs + 1))
+  done
+  if [[ -n "$_extdir" ]]; then
+    echo "  ok: router extension shipped ($_extdir)"
+  else
+    echo "  WARN: router extension missing (re-run install.sh; chrome-app links stay in-app)"
+  fi
+  if [[ "$_manifs" -gt 0 ]]; then
+    printf '  ok: native host registered for %d browser profile(s)\n' "$_manifs"
+  else
+    echo "  info: native host not registered yet (registers on next chrome-app launch)"
+  fi
+  if command -v xdg-open >/dev/null 2>&1 || command -v gio >/dev/null 2>&1; then
+    echo "  ok: url opener present (xdg-open/gio)"
+  else
+    echo "  WARN: no xdg-open/gio — link-out has nothing to hand URLs to"
   fi
   echo "== soft dependencies (features degrade gracefully without these) =="
   for c in gum file jq kwriteconfig6 kbuildsycoca6 update-desktop-database gtk-update-icon-cache desktop-file-validate busctl; do
@@ -500,6 +602,31 @@ deps() {
     echo "  ok: GLOBIGNORE unset"
   else
     echo "  info: GLOBIGNORE is set to '$INHERITED_GLOBIGNORE' (webapp scripts are immune: find-based scans)"
+  fi
+  echo "== shell PATH wiring (is the toolkit on PATH after a fresh login?) =="
+  # Own dir covers custom --prefix installs; default dir covers the standard
+  # layout (either one wired is fine).
+  _owndir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _defdir="$HOME/.local/share/webapps/bin"
+  printf '  login shell: %s\n' "${SHELL:-unknown}"
+  if [[ ":$PATH:" == *":$_owndir:"* ]]; then
+    echo "  ok: toolkit bin dir on PATH in this shell"
+  else
+    echo "  WARN: toolkit bin dir NOT on PATH in this shell (open a new terminal / re-run install.sh)"
+  fi
+  _wired=""
+  for _rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.config/fish/config.fish"; do
+    if [[ -f "$_rc" ]] && grep -q -F -e "$_owndir" -e "$_defdir" "$_rc" 2>/dev/null; then
+      _wired="$_wired $(basename "$_rc")"
+    fi
+  done
+  if [[ -n "$_wired" ]]; then
+    printf '  ok: PATH wiring present in:%s\n' "$_wired"
+  else
+    echo "  WARN: no PATH wiring found in ~/.bashrc, ~/.zshrc, or fish config.fish (re-run install.sh)"
+  fi
+  if [[ "${SHELL:-}" == *fish* ]] && ! grep -q -F -e "$_owndir" -e "$_defdir" "$HOME/.config/fish/config.fish" 2>/dev/null; then
+    echo "  WARN: login shell is fish but config.fish has no webapp-kit PATH block (re-run install.sh)"
   fi
   if [[ -n "${missing_hard// }" ]]; then
     if declare -F webapp_install_cmd >/dev/null 2>&1; then

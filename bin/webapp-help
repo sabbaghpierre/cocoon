@@ -25,6 +25,10 @@ COMMANDS
                                 webapp-create
                                 webapp-create "ChatGPT" https://chatgpt.com chrome
                                 webapp-create --name "X" --url https://x.com --engine firefox
+                                webapp-create --name "Y" --url https://y.com --browser vivaldi-stable
+  webapp-browsers               List installed browsers usable for webapps
+                                (chrome, vivaldi, ungoogled-chromium, firefox,
+                                librewolf, zen, ...). --json for machine use.
   webapp-launch-chrome          Run a URL as an isolated Chrome SSB window.
                                 (Invoked by .desktop files; rarely by hand.)
   webapp-launch-firefox         Run a URL in a self-contained Firefox profile
@@ -63,15 +67,33 @@ WHERE THINGS LIVE
 
 NOTES
   - Each webapp is isolated: own Chrome data dir or Firefox profile (log in once).
+  - Each webapp is pinned to the browser you picked at creation
+    (see its .desktop Exec line: --browser "..."). Older apps without a pin
+    use the first-found binary of their engine.
+  - Chrome-engine apps route EVERY clicked link to your system default
+    browser (link-router extension + webapp-open-external via xdg-open);
+    the webapp window only ever shows its pinned site. Same-document
+    anchors, downloads, and mailto:/tel: links are untouched.
+  - Firefox-engine apps keep clicks in-app: Mozilla requires AMO signing
+    for release-Firefox extensions (no per-profile override), so the router
+    cannot install there. Prefer a chromium browser when link-out matters.
+  - Firefox-family browsers (firefox, librewolf, zen, floorp, ...) all work
+    with the firefox engine (same profile + userChrome.css mechanism).
+    Note: LibreWolf clears cookies/history aggressively by default.
   - Firefox apps use native Wayland, dedicated app_id, and (on Plasma) a KWin
     rule so the taskbar shows the site icon, not the browser logo.
+  - Flatpak browsers are listed by webapp-browsers but cannot back webapps
+    yet (list-only in v1; install the native package instead).
 
 PORTABILITY (distro- and DE-agnostic by design)
-  Hard requirements: bash, curl, setsid + one browser (firefox or a
-  Chromium-family build for the chrome engine). Run webapp-doctor --deps
+  Hard requirements: bash, curl, setsid + one browser (any Chromium-family
+  build for the chrome engine, or firefox/librewolf/zen/... for the firefox
+  engine). Run webapp-browsers to list yours, webapp-doctor --deps
   for a full check with install commands for your distro.
   - Any distro: no package-manager calls in the code; only the install
     tips adapt (xbps/pacman/dnf/apt/zypper).
+  - bash, zsh, and fish: the installer wires PATH for all three
+    (fish via ~/.config/fish/config.fish). Runtime needs only bash.
   - Any Wayland/X11 desktop: .desktop files use absolute Exec paths, so
     they work regardless of session PATH. Icon matching uses app_id +
     StartupWMClass everywhere, plus a KWin rule automatically on Plasma.
