@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# webapp-doctor — diagnose a webapp installation end to end.
+# cocoon-doctor — diagnose a cocoon installation end to end.
 #
 # Checks, per app: .desktop fields, launcher presence, icon file, profile dir,
 # stylesheet version, KWin rule, and whether a live process matches.
 # Also flags orphans (data/rules without a .desktop).
 #
-# Usage: webapp-doctor [name...]   (no args: check all webapps + orphans)
-#        webapp-doctor --probe [name]
+# Usage: cocoon-doctor [name...]   (no args: check all cocoon + orphans)
+#        cocoon-doctor --probe [name]
 #   --probe samples live window info for 10s (focus the app window
 #   first). Prints window identity + matched .desktop file — the ground
 #   truth for icon issues. Backend auto-detected: KWin, niri, Hyprland,
 #   Sway (GNOME: prints Looking Glass instructions).
-#        webapp-doctor --deps
+#        cocoon-doctor --deps
 #   --deps checks hard/soft dependencies with per-distro install hints.
 set -uo pipefail
 
@@ -32,35 +32,116 @@ cmd_version() {
   fi
 }
 
+# Shared data roots — sourced BEFORE assigning DATA_ROOT so env overrides and
+# the legacy read fallback drive every check below (source-only, stdout-silent).
+MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1090
+source "$MODULE_DIR/cocoon-paths.sh" 2>/dev/null || true
 ICON_DIR="$HOME/.local/share/applications/icons"
 DESKTOP_DIR="$HOME/.local/share/applications"
-DATA_ROOT="$HOME/.local/share/webapps"
+DATA_ROOT="$HOME/.local/share/cocoon"
+LEGACY_DATA_ROOT="$HOME/.local/share/webapps"
+DATA_ROOTS=("$DATA_ROOT" "$LEGACY_DATA_ROOT")
+if declare -F cocoon_data_root >/dev/null 2>&1; then
+  _p="$(cocoon_data_root 2>/dev/null || true)"
+  [[ -n "$_p" ]] && DATA_ROOT="$_p"
+fi
+if declare -F cocoon_legacy_data_root >/dev/null 2>&1; then
+  _p="$(cocoon_legacy_data_root 2>/dev/null || true)"
+  [[ -n "$_p" ]] && LEGACY_DATA_ROOT="$_p"
+fi
+if declare -F cocoon_data_roots >/dev/null 2>&1; then
+  mapfile -t _roots < <(cocoon_data_roots 2>/dev/null || true)
+  ((${#_roots[@]} > 0)) && DATA_ROOTS=("${_roots[@]}")
+fi
 KWIN_RULES_FILE="$HOME/.config/kwinrulesrc"
 
+# Resolvers with hardcoded defaults for old installs lacking cocoon-paths.sh.
+cocoon_profile_path() { # <engine> <slug>
+  if declare -F cocoon_find_profile >/dev/null 2>&1; then
+    cocoon_find_profile "$1" "$2" 2>/dev/null || true
+    return 0
+  fi
+  printf '%s/%s-%s' "$DATA_ROOT" "$1" "$2"
+}
+cocoon_log_path() { # <slug>
+  if declare -F cocoon_find_log >/dev/null 2>&1; then
+    cocoon_find_log "$1" 2>/dev/null || true
+    return 0
+  fi
+  printf '%s/%s.log' "$DATA_ROOT" "$1"
+}
+cocoon_ext_path() {
+  if declare -F cocoon_find_ext >/dev/null 2>&1; then
+    cocoon_find_ext 2>/dev/null || true
+    return 0
+  fi
+  printf '%s/ext/open-external' "$DATA_ROOT"
+}
+
 # env helpers (compositor/distro detection); optional.
-ENV_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webapp-env.sh"
+ENV_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cocoon-env.sh"
 if [[ -f "$ENV_HELPER" ]]; then
   # shellcheck disable=SC1090
   source "$ENV_HELPER"
 fi
 
 # browser helpers (single source of truth for detection); optional.
-BROWSERS_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webapp-browsers"
+BROWSERS_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cocoon-browsers"
 if [[ -f "$BROWSERS_HELPER" ]]; then
   # shellcheck disable=SC1090
   source "$BROWSERS_HELPER" 2>/dev/null || true
+  # The helper enables `set -e` for its own CLI mode; this script deliberately
+  # runs without it so independent checks can accumulate warnings.
+  set +e
 fi
 
-# parse_browser <exec-line> -> pinned --browser id or empty (never fails)
+# Reverse cocoon-create's exec_escape so ids/paths read back as authored.
+unescape_exec_field() {
+  printf '%s' "$1" | sed -e 's/\\\\/\\/g' -e 's/\\"/"/g' -e 's/\\\$/$/g' -e 's/\\`/`/g' -e 's/%%/%/g'
+}
+
+# parse_browser <exec-line> -> pinned --browser id or path (empty if none).
+# Quote-aware: a custom path may contain spaces (and escaped quotes).
 parse_browser() {
-  printf '%s' "$1" | sed -n 's/.*--browser[ "]*\([^ "]*\).*/\1/p' | head -n1 || true
+  local line="$1" val=""
+  if [[ "$line" =~ --browser[[:space:]]+\"(([^\"\\]|\\.)*)\" ]]; then
+    val="${BASH_REMATCH[1]}"
+  elif [[ "$line" =~ --browser[[:space:]]+([^[:space:]\"]+) ]]; then
+    val="${BASH_REMATCH[1]}"
+  fi
+  unescape_exec_field "$val"
+}
+
+# browser_available <id-or-path> -> true when it can be executed/resolved.
+# PATH-only checks (command -v) reject custom paths with a slash.
+browser_available() {
+  local val="$1" resolved="" app
+  if declare -F cocoon_browser_is_flatpak >/dev/null 2>&1 && cocoon_browser_is_flatpak "$val"; then
+    # Flatpak pins are checked as apps, never as PATH executables.
+    app="$(cocoon_browser_flatpak_app "$val" 2>/dev/null || true)"
+    [[ -n "$app" ]] || return 1
+    declare -F cocoon_browser_known >/dev/null 2>&1 && cocoon_browser_known "$val" || return 1
+    declare -F cocoon_browser_flatpak_installed >/dev/null 2>&1 && cocoon_browser_flatpak_installed "$app" || return 1
+    return 0
+  fi
+  if declare -F cocoon_browser_resolve >/dev/null 2>&1; then
+    resolved="$(cocoon_browser_resolve "$val" 2>/dev/null || true)"
+    [[ -n "$resolved" ]]
+    return $?
+  fi
+  if [[ "$val" == */* ]]; then
+    [[ -f "$val" && -x "$val" ]]
+    return $?
+  fi
+  command -v "$val" >/dev/null 2>&1
 }
 
 # compositor(): plasma|niri|hyprland|sway|gnome|unknown (plasma if undetectable,
 # preserving historical behavior for old installs without the helper).
 compositor() {
-  if declare -F webapp_compositor >/dev/null 2>&1; then
-    webapp_compositor
+  if declare -F cocoon_compositor >/dev/null 2>&1; then
+    cocoon_compositor
   else
     printf 'plasma'
   fi
@@ -76,8 +157,53 @@ slugify() {
   s="${s// /-}"
   s="$(printf '%s' "$s" | tr -c '[:alnum:]-_.' '-')"
   s="$(printf '%s' "$s" | sed -e 's/-\{2,\}/-/g' -e 's/^[-.]//' -e 's/[-.]$//')"
-  [[ -z "$s" ]] && s="webapp"
+  [[ -z "$s" ]] && s="cocoon"
   printf '%s' "$s"
+}
+
+# linkout_status <engine> <slug> <browser>
+# Prints: on | pending | unsupported | missing-ext | off
+# Honest status: the manifest must exist in the app's ISOLATED user-data-dir
+# (Chrome ignores brand config dirs when --user-data-dir is overridden), the
+# extension must be installed, and the browser must still honor --load-extension.
+linkout_status() {
+  local engine="$1" slug="$2" browser="$3"
+  local ext="" cfg base ver major manifest=""
+  [[ "$engine" == "chrome" ]] || { printf 'off'; return 0; }
+  # Sandboxed Flatpak browsers cannot see the host native-messaging host.
+  # Return early so no id string is ever passed to a --version probe.
+  if declare -F cocoon_browser_is_flatpak >/dev/null 2>&1 &&
+    cocoon_browser_is_flatpak "$browser"; then
+    printf 'unsupported'
+    return 0
+  fi
+  ext="$(cocoon_ext_path)"
+  [[ -n "$ext" && -f "$ext/manifest.json" && -f "$ext/inject.js" ]] || { printf 'missing-ext'; return 0; }
+  base="${browser##*/}"
+  [[ -n "$base" ]] || base="google-chrome"
+  if declare -F cocoon_browser_version >/dev/null 2>&1; then
+    ver="$(cocoon_browser_version "$browser" 2>/dev/null || true)"
+  else
+    ver="$(timeout 5 "$browser" --version 2>/dev/null | head -n1 || true)"
+  fi
+  case "$base:$ver" in
+    google-chrome* | chrome | *:"Google Chrome "*)
+      if [[ "$ver" =~ ([0-9]+)\. ]]; then
+        major="${BASH_REMATCH[1]}"
+        if ((major >= 137)); then printf 'unsupported'; return 0; fi
+      fi
+      ;;
+  esac
+  manifest="$(cocoon_profile_path chrome "$slug")/NativeMessagingHosts/com.cocoon.open_external.json"
+  if [[ ! -f "$manifest" ]]; then
+    for cfg in google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera; do
+      if [[ -f "$HOME/.config/$cfg/NativeMessagingHosts/com.cocoon.open_external.json" ]]; then
+        manifest="legacy"
+        break
+      fi
+    done
+  fi
+  if [[ -n "$manifest" ]]; then printf 'on'; else printf 'pending'; fi
 }
 
 check_app() {
@@ -93,8 +219,8 @@ check_app() {
   icon="$(grep -m1 '^Icon=' "$desktop" | cut -d= -f2- || true)"
   wmclass="$(grep -m1 '^StartupWMClass=' "$desktop" | cut -d= -f2- || true)"
   engine="custom"
-  [[ "$exec_line" == *"webapp-launch-chrome"* ]] && engine="chrome"
-  [[ "$exec_line" == *"webapp-launch-firefox"* ]] && engine="firefox"
+  [[ "$exec_line" == *"cocoon-launch-chrome"* || "$exec_line" == *" launch chrome "* ]] && engine="chrome"
+  [[ "$exec_line" == *"cocoon-launch-firefox"* || "$exec_line" == *" launch firefox "* ]] && engine="firefox"
   slug="$(printf '%s' "$exec_line" | sed -n 's/.*--name "\([^"]*\)".*/\1/p;s/.*--name \([^ "]*\).*/\1/p' | head -n1 || true)"
   [[ -z "$slug" ]] && slug="$(slugify "$name")"
   slug="$(slugify "$slug")"
@@ -105,10 +231,10 @@ check_app() {
   if [[ -x "$launcher" ]]; then ok "launcher $launcher"; else warn "launcher not executable: $launcher"; fi
   if [[ "$engine" == "chrome" || "$engine" == "firefox" ]]; then
     if [[ -n "$browser" ]]; then
-      if command -v "$browser" >/dev/null 2>&1; then
+      if browser_available "$browser"; then
         ok "browser $browser"
       else
-        warn "pinned browser '$browser' not found on PATH (run 'webapp-browsers'; recreate or edit Exec)"
+        warn "pinned browser '$browser' not found (not executable; recreate or edit Exec)"
       fi
     else
       info "no pinned browser (legacy app: launches with first-found $engine binary)"
@@ -118,22 +244,19 @@ check_app() {
   # (Firefox engine: Mozilla requires AMO signing for release-Firefox
   # extensions with no per-profile override, so no router can install there.)
   if [[ "$engine" == "chrome" ]]; then
-    _lself="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    _lext=""
-    for _lcand in "$_lself/../ext/open-external" "$HOME/.local/share/webapps/ext/open-external"; do
-      if [[ -f "$_lcand/manifest.json" && -f "$_lcand/inject.js" ]]; then _lext="$_lcand"; break; fi
-    done
-    _lman=0
-    for _lcfg in google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera; do
-      [[ -f "$HOME/.config/$_lcfg/NativeMessagingHosts/com.webappkit.open_external.json" ]] && _lman=$((_lman + 1))
-    done
-    if [[ -n "$_lext" && "$_lman" -gt 0 ]]; then
-      ok "link-out on (clicks open in system default browser)"
-    elif [[ -z "$_lext" ]]; then
-      warn "link-router ext missing (re-run install.sh); clicks stay in-app"
-    else
-      info "link-out registers on next launch (native host not installed yet)"
-    fi
+    case "$(linkout_status "$engine" "$slug" "$browser")" in
+      on) ok "link-out on (clicks open in system default browser)" ;;
+      missing-ext) warn "link-router ext missing (re-run install.sh); clicks stay in-app" ;;
+      unsupported)
+        if declare -F cocoon_browser_is_flatpak >/dev/null 2>&1 &&
+          cocoon_browser_is_flatpak "$browser"; then
+          info "link-out unsupported in sandbox (flatpak); clicks stay in-app"
+        else
+          warn "$browser 137+ ignores --load-extension; clicks stay in-app"
+        fi
+        ;;
+      *) info "link-out registers on next launch (native host not installed yet)" ;;
+    esac
   elif [[ "$engine" == "firefox" ]]; then
     info "firefox engine keeps clicks in-app (Mozilla signing blocks the router; use a chromium browser for link-out)"
   fi
@@ -155,29 +278,39 @@ check_app() {
     else
       ok "icon $icon -> $icon_path"
     fi
+  elif [[ -z "$icon" ]]; then
+    info "no icon set (created with --no-icon or offline favicon fetch)"
   else
-    warn "icon missing: ${icon:-(none set)}"
+    warn "icon missing: $icon"
   fi
   if [[ -n "$wmclass" ]]; then ok "StartupWMClass=$wmclass"; else warn "no StartupWMClass"; fi
   if command -v desktop-file-validate >/dev/null 2>&1; then
     if desktop-file-validate "$desktop" 2>/dev/null; then ok "desktop-file-validate"; else warn "desktop-file-validate failed"; fi
   fi
 
+  local pdir
   if [[ "$engine" == "chrome" ]]; then
-    if [[ -d "$DATA_ROOT/chrome-${slug}" ]]; then ok "data dir $DATA_ROOT/chrome-${slug}"; else info "data dir not created yet (first launch creates it)"; fi
+    pdir="$(cocoon_profile_path chrome "$slug")"
+    if [[ -d "$pdir" ]]; then
+      ok "data dir $pdir"
+      [[ "$pdir" == "$LEGACY_DATA_ROOT"/* ]] && info "profile resolved from legacy data root (read transparently)"
+    else
+      info "data dir not created yet (first launch creates it)"
+    fi
   elif [[ "$engine" == "firefox" ]]; then
-    local pdir="$DATA_ROOT/firefox-${slug}"
+    pdir="$(cocoon_profile_path firefox "$slug")"
     if [[ -d "$pdir" ]]; then
       ok "profile dir $pdir"
+      [[ "$pdir" == "$LEGACY_DATA_ROOT"/* ]] && info "profile resolved from legacy data root (read transparently)"
       if grep -qF 'toolkit.legacyUserProfileCustomizations.stylesheets' "$pdir/user.js" 2>/dev/null; then
         ok "stylesheets pref set"
       else
         warn "stylesheets pref missing in $pdir/user.js (CSS will not apply)"
       fi
       if [[ -f "$pdir/chrome/userChrome.css" ]]; then
-        if grep -q 'webapp minimal UI v3' "$pdir/chrome/userChrome.css" 2>/dev/null; then
+        if grep -q 'cocoon minimal UI v3' "$pdir/chrome/userChrome.css" 2>/dev/null; then
           ok "userChrome.css v3 (window controls kept)"
-        elif grep -q 'auto-generated by webapp-launch-firefox' "$pdir/chrome/userChrome.css" 2>/dev/null; then
+        elif grep -q 'auto-generated by cocoon-launch-firefox' "$pdir/chrome/userChrome.css" 2>/dev/null; then
           warn "userChrome.css is v1/v2 (hides titlebar); relaunch to migrate"
         else
           info "custom userChrome.css (managed by you)"
@@ -189,8 +322,8 @@ check_app() {
       info "profile dir not created yet (first launch creates it)"
     fi
     # Legacy named-profile leftovers from before ice-style dirs.
-    if ls -d "$HOME"/.config/mozilla/firefox/*."${slug}-webapp" "$HOME"/.mozilla/firefox/*."${slug}-webapp" >/dev/null 2>&1; then
-      warn "legacy named profile(s) *.$slug-webapp still exist (safe to delete once the new dir works)"
+    if ls -d "$HOME"/.config/mozilla/firefox/*."${slug}-cocoon" "$HOME"/.mozilla/firefox/*."${slug}-cocoon" >/dev/null 2>&1; then
+      warn "legacy named profile(s) *.$slug-cocoon still exist (safe to delete once the new dir works)"
     fi
   else
     info "custom Exec, skipping engine checks"
@@ -213,7 +346,7 @@ check_app() {
       cur = $0; has_df = 0; has_m = 0; next
     }
     $0 == ("desktopfile=" ENVIRON["KWEX_T"]) { has_df = 1; next }
-    /^Description=webapp: / { has_m = 1; next }
+    /^Description=cocoon: / { has_m = 1; next }
     END { if (cur != "" && has_df && has_m) n++; print n + 0 }
   ' "$KWIN_RULES_FILE" 2>/dev/null || echo 0)"
   fi
@@ -228,8 +361,11 @@ check_app() {
   else
     info "no live process (app not running)"
   fi
-  if [[ -f "$DATA_ROOT/${slug}.log" ]]; then
-    info "last log: $(tail -n1 "$DATA_ROOT/${slug}.log" 2>/dev/null)"
+  local logfile
+  logfile="$(cocoon_log_path "$slug")"
+  if [[ -f "$logfile" ]]; then
+    info "last log: $(tail -n1 "$logfile" 2>/dev/null)"
+    [[ "$logfile" == "$LEGACY_DATA_ROOT"/* ]] && info "log found in legacy data root (new logs go to $DATA_ROOT)"
   fi
 }
 
@@ -244,8 +380,8 @@ check_app_json() {
   local name="$1"
   local desktop="$DESKTOP_DIR/$name.desktop"
   local -a issues=()
-  local exec_line="" icon="" wmclass="" engine="custom" slug="" url="" launcher="" icon_path="" browser=""
-  local linkout=false
+  local exec_line="" icon="" wmclass="" engine="custom" slug="" url="" launcher="" icon_path="" browser="" pdir="" _log=""
+  local linkout=false linkout_state="off"
   local desktop_valid="" profile_dir="" css_version="n/a" kwin_rule=false live=false log_tail=""
   if [[ ! -f "$desktop" ]]; then
     issues+=("no .desktop file ($desktop)")
@@ -254,8 +390,8 @@ check_app_json() {
     icon="$(grep -m1 '^Icon=' "$desktop" | cut -d= -f2- || true)"
     wmclass="$(grep -m1 '^StartupWMClass=' "$desktop" | cut -d= -f2- || true)"
     engine="custom"
-    [[ "$exec_line" == *"webapp-launch-chrome"* ]] && engine="chrome"
-    [[ "$exec_line" == *"webapp-launch-firefox"* ]] && engine="firefox"
+    [[ "$exec_line" == *"cocoon-launch-chrome"* || "$exec_line" == *" launch chrome "* ]] && engine="chrome"
+    [[ "$exec_line" == *"cocoon-launch-firefox"* || "$exec_line" == *" launch firefox "* ]] && engine="firefox"
     slug="$(printf '%s' "$exec_line" | sed -n 's/.*--name "\([^"]*\)".*/\1/p;s/.*--name \([^ "]*\).*/\1/p' | head -n1 || true)"
     [[ -z "$slug" ]] && slug="$(slugify "$name")"
     slug="$(slugify "$slug")"
@@ -263,20 +399,25 @@ check_app_json() {
     launcher="$(printf '%s' "$exec_line" | awk '{print $1}')"
     browser="$(parse_browser "$exec_line")"
     [[ -x "$launcher" ]] || issues+=("launcher not executable: $launcher")
-    if [[ ("$engine" == "chrome" || "$engine" == "firefox") && -n "$browser" ]] && ! command -v "$browser" >/dev/null 2>&1; then
-      issues+=("pinned browser '$browser' not found on PATH")
+    if [[ ("$engine" == "chrome" || "$engine" == "firefox") && -n "$browser" ]] && ! browser_available "$browser"; then
+      issues+=("pinned browser '$browser' not found (not executable)")
     fi
     linkout=false
-    if [[ "$engine" == "chrome" ]]; then      _lself="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-      _lext=false; _lman=false
-      for _lcand in "$_lself/../ext/open-external" "$HOME/.local/share/webapps/ext/open-external"; do
-        if [[ -f "$_lcand/manifest.json" && -f "$_lcand/inject.js" ]]; then _lext=true; break; fi
-      done
-      for _lcfg in google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera; do
-        if [[ -f "$HOME/.config/$_lcfg/NativeMessagingHosts/com.webappkit.open_external.json" ]]; then _lman=true; break; fi
-      done
-      if [[ "$_lext" == "true" && "$_lman" == "true" ]]; then linkout=true; fi
-      if [[ "$_lext" != "true" ]]; then issues+=("link-router ext missing (re-run install.sh); clicks stay in-app"); fi
+    if [[ "$engine" == "chrome" ]]; then
+      local _los
+      _los="$(linkout_status "$engine" "$slug" "$browser")"
+      linkout_state="$_los"
+      case "$_los" in
+        on) linkout=true ;;
+        missing-ext) issues+=("link-router ext missing (re-run install.sh); clicks stay in-app") ;;
+        unsupported)
+          # Flatpak sandbox limits are expected, not a health issue.
+          if ! declare -F cocoon_browser_is_flatpak >/dev/null 2>&1 ||
+            ! cocoon_browser_is_flatpak "$browser"; then
+            issues+=("$browser 137+ ignores --load-extension; clicks stay in-app")
+          fi
+          ;;
+      esac
     fi
     icon_path="$icon"
     if [[ -n "$icon" && "$icon" != */* ]]; then
@@ -298,17 +439,18 @@ check_app_json() {
     if command -v desktop-file-validate >/dev/null 2>&1; then
       if desktop-file-validate "$desktop" 2>/dev/null; then desktop_valid=true; else desktop_valid=false; issues+=("desktop-file-validate failed"); fi
     fi
+    pdir="$(cocoon_profile_path "$engine" "$slug")"
     if [[ "$engine" == "chrome" ]]; then
-      [[ -d "$DATA_ROOT/chrome-${slug}" ]] && profile_dir="$DATA_ROOT/chrome-${slug}"
+      [[ -d "$pdir" ]] && profile_dir="$pdir"
     elif [[ "$engine" == "firefox" ]]; then
-      if [[ -d "$DATA_ROOT/firefox-${slug}" ]]; then
-        profile_dir="$DATA_ROOT/firefox-${slug}"
+      if [[ -d "$pdir" ]]; then
+        profile_dir="$pdir"
         grep -qF 'toolkit.legacyUserProfileCustomizations.stylesheets' "$profile_dir/user.js" 2>/dev/null \
           || issues+=("stylesheets pref missing (CSS will not apply)")
         if [[ -f "$profile_dir/chrome/userChrome.css" ]]; then
-          if grep -q 'webapp minimal UI v3' "$profile_dir/chrome/userChrome.css" 2>/dev/null; then
+          if grep -q 'cocoon minimal UI v3' "$profile_dir/chrome/userChrome.css" 2>/dev/null; then
             css_version="v3"
-          elif grep -q 'auto-generated by webapp-launch-firefox' "$profile_dir/chrome/userChrome.css" 2>/dev/null; then
+          elif grep -q 'auto-generated by cocoon-launch-firefox' "$profile_dir/chrome/userChrome.css" 2>/dev/null; then
             css_version="v1/v2"; issues+=("userChrome.css is v1/v2 (hides titlebar); relaunch to migrate")
           else
             css_version="custom"
@@ -317,8 +459,8 @@ check_app_json() {
           css_version="missing"; issues+=("no chrome/userChrome.css (relaunch to seed it)")
         fi
       fi
-      if ls -d "$HOME"/.config/mozilla/firefox/*."${slug}-webapp" "$HOME"/.mozilla/firefox/*."${slug}-webapp" >/dev/null 2>&1; then
-        issues+=("legacy named profile(s) *.$slug-webapp still exist")
+      if ls -d "$HOME"/.config/mozilla/firefox/*."${slug}-cocoon" "$HOME"/.mozilla/firefox/*."${slug}-cocoon" >/dev/null 2>&1; then
+        issues+=("legacy named profile(s) *.$slug-cocoon still exist")
       fi
     fi
     local comp
@@ -336,14 +478,15 @@ check_app_json() {
         cur = $0; has_df = 0; has_m = 0; next
       }
       $0 == ("desktopfile=" ENVIRON["KWEX_T"]) { has_df = 1; next }
-      /^Description=webapp: / { has_m = 1; next }
+      /^Description=cocoon: / { has_m = 1; next }
       END { if (cur != "" && has_df && has_m) n++; print n + 0 }
     ' "$KWIN_RULES_FILE" 2>/dev/null || echo 0)"
       if [[ "$dupes" -gt 1 ]]; then issues+=("$dupes duplicate KWin rules"); fi
     fi
     procs="$(ps -eo args 2>/dev/null || true)"
     if printf '%s' "$procs" | grep -F -q -- "--name $slug"; then live=true; fi
-    [[ -f "$DATA_ROOT/${slug}.log" ]] && log_tail="$(tail -n1 "$DATA_ROOT/${slug}.log" 2>/dev/null || true)"
+    _log="$(cocoon_log_path "$slug")"
+    [[ -f "$_log" ]] && log_tail="$(tail -n1 "$_log" 2>/dev/null || true)"
   fi
   local issues_json="" it
   for it in ${issues[@]+"${issues[@]}"}; do
@@ -351,29 +494,32 @@ check_app_json() {
     issues_json="$issues_json\"$(json_escape "$it")\""
   done
   JSON_ISSUES+=(${issues[@]+"${issues[@]}"})
-  printf '{"name":"%s","engine":"%s","browser":"%s","linkout":%s,"url":"%s","desktop":"%s","icon":"%s","icon_path":"%s","startup_wmclass":"%s","desktop_valid":%s,"profile_dir":"%s","css_version":"%s","kwin_rule":%s,"live":%s,"log_tail":"%s","issues":[%s]}' \
-    "$(json_escape "$name")" "$engine" "$(json_escape "$browser")" "$linkout" "$(json_escape "$url")" "$(json_escape "$desktop")" \
+  printf '{"name":"%s","engine":"%s","browser":"%s","linkout":%s,"linkout_status":"%s","url":"%s","desktop":"%s","icon":"%s","icon_path":"%s","startup_wmclass":"%s","desktop_valid":%s,"profile_dir":"%s","css_version":"%s","kwin_rule":%s,"live":%s,"log_tail":"%s","issues":[%s]}' \
+    "$(json_escape "$name")" "$engine" "$(json_escape "$browser")" "$linkout" "$linkout_state" "$(json_escape "$url")" "$(json_escape "$desktop")" \
     "$(json_escape "$icon")" "$(json_escape "$icon_path")" "$(json_escape "$wmclass")" \
     "${desktop_valid:-null}" "$(json_escape "$profile_dir")" "$css_version" "$kwin_rule" "$live" \
     "$(json_escape "$log_tail")" "$issues_json"
 }
 
-check_orphans() {  local d base found=0
-  for d in "$DATA_ROOT"/firefox-* "$DATA_ROOT"/chrome-*; do
-    [[ -e "$d" ]] || continue
-    base="$(basename "$d")"
-    # dir names are <engine>-<slug>; find desktop whose slug matches
-    found=0
-    while IFS= read -r -d '' f; do
-      if grep -q '^Exec=.*webapp-launch-' "$f" 2>/dev/null; then
-        n="$(basename "${f%.desktop}")"
-        if [[ "$(slugify "$n")" == "${base#*-}" ]]; then found=1; break; fi
-      fi
-    done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
-    if [[ "$found" == "0" ]]; then warn "orphan data dir without .desktop: $d"; fi
+check_orphans() {  local d base found=0 root
+  for root in "${DATA_ROOTS[@]}"; do
+    [[ -n "$root" ]] || continue
+    for d in "$root"/firefox-* "$root"/chrome-*; do
+      [[ -e "$d" ]] || continue
+      base="$(basename "$d")"
+      # dir names are <engine>-<slug>; find desktop whose slug matches
+      found=0
+      while IFS= read -r -d '' f; do
+        if grep -Eq '^Exec=.*(cocoon-launch-|cocoon launch (chrome|firefox))' "$f" 2>/dev/null; then
+          n="$(basename "${f%.desktop}")"
+          if [[ "$(slugify "$n")" == "${base#*-}" ]]; then found=1; break; fi
+        fi
+      done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
+      if [[ "$found" == "0" ]]; then warn "orphan data dir without .desktop: $d"; fi
+    done
   done
-  # legacy named profiles
-  for d in "$HOME"/.config/mozilla/firefox/*-webapp "$HOME"/.mozilla/firefox/*-webapp; do
+  # legacy named profiles (pre-ice-style; separate from the webapps data root)
+  for d in "$HOME"/.config/mozilla/firefox/*-cocoon "$HOME"/.mozilla/firefox/*-cocoon; do
     [[ -d "$d" ]] || continue
     warn "legacy orphan profile (pre-ice-style): $d"
   done
@@ -527,18 +673,29 @@ probe() {
 # deps: hard vs soft dependency report with per-distro install hints.
 deps() {
   local missing_hard="" c hint
-  echo "== hard dependencies (webapps break without these) =="
-  for c in bash curl setsid; do
+  # A flatpak:<app-id> pin makes flatpak a hard dependency; otherwise it is
+  # only a soft one (native apps keep working without it).
+  local flatpak_pin=false _desktop
+  while IFS= read -r -d '' _desktop; do
+    if grep -Eq -- '--browser[[:space:]]+"?flatpak:' "$_desktop" 2>/dev/null; then
+      flatpak_pin=true
+      break
+    fi
+  done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null || true)
+  local hard_deps=(bash curl setsid)
+  [[ "$flatpak_pin" == "true" ]] && hard_deps+=(flatpak)
+  echo "== hard dependencies (cocoon break without these) =="
+  for c in ${hard_deps[@]+"${hard_deps[@]}"}; do
     if command -v "$c" >/dev/null 2>&1; then
       printf '  ok: %s\n' "$c"
     else
       printf '  MISSING: %s\n' "$c"; missing_hard="$missing_hard $c"
     fi
   done
-  # Browsers via the webapp-browsers detector (single source of truth).
-  local _brows="" _id _eng _bin _name _ver _row
-  if declare -F webapp_browsers_native_rows >/dev/null 2>&1; then
-    _brows="$(webapp_browsers_native_rows "")"
+  # Browsers via the cocoon-browsers detector (single source of truth).
+  local _brows="" _id _eng _bin _name _ver _row _have_browser=false
+  if declare -F cocoon_browsers_native_rows >/dev/null 2>&1; then
+    _brows="$(cocoon_browsers_native_rows "")"
   else
     for c in firefox google-chrome-stable google-chrome chromium chromium-browser brave-browser brave vivaldi-stable; do
       if command -v "$c" >/dev/null 2>&1; then
@@ -548,23 +705,42 @@ deps() {
     done
   fi
   if [[ -n "$_brows" ]]; then
+    _have_browser=true
     while IFS=$'\t' read -r _id _eng _bin _name _ver; do
       [[ -z "$_id" ]] && continue
       printf '  ok: %s (%s engine)%s\n' "$_id" "$_eng" "${_ver:+ — $_ver}"
     done <<<"$_brows"
-  else
-    printf '  MISSING: no supported browser (run webapp-browsers for details)\n'
+  fi
+  # Flatpak browsers count as installed browsers too (source-aware).
+  if declare -F cocoon_browsers_flatpak_rows >/dev/null 2>&1; then
+    local _fid _feng _fbin _fname _fver
+    while IFS=$'\t' read -r _fid _feng _fbin _fname _fver; do
+      [[ -z "$_fid" ]] && continue
+      _have_browser=true
+      printf '  ok: %s (%s engine, flatpak)%s\n' "$_fid" "$_feng" "${_fver:+ — $_fver}"
+    done < <(cocoon_browsers_flatpak_rows "" 2>/dev/null || true)
+  fi
+  if [[ "$_have_browser" != "true" ]]; then
+    printf '  MISSING: no supported browser (run cocoon-browsers for details)\n'
     missing_hard="$missing_hard browser"
   fi
-  echo "== link-out (webapp links -> system default browser) =="
-  _selfdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  _extdir=""
-  for _cand in "$_selfdir/../ext/open-external" "$HOME/.local/share/webapps/ext/open-external"; do
-    if [[ -f "$_cand/manifest.json" && -f "$_cand/inject.js" ]]; then _extdir="$_cand"; break; fi
+  echo "== legacy install paths (read-only check; never written here) =="
+  for _ldir in "$LEGACY_DATA_ROOT/bin" "$LEGACY_DATA_ROOT/libexec"; do
+    if [[ -d "$_ldir" ]]; then
+      echo "  info: legacy dir present: $_ldir"
+    else
+      echo "  info: no legacy dir: $_ldir"
+    fi
   done
+  if declare -F cocoon_find_libexec_helper >/dev/null 2>&1; then
+    _lh="$(cocoon_find_libexec_helper cocoon-browsers 2>/dev/null || true)"
+    [[ -n "$_lh" ]] && echo "  info: helper visible via fallback: $_lh"
+  fi
+  echo "== link-out (cocoon links -> system default browser) =="
+  _extdir="$(cocoon_ext_path)"
   _manifs=0
   for _cfg in google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera; do
-    [[ -f "$HOME/.config/$_cfg/NativeMessagingHosts/com.webappkit.open_external.json" ]] && _manifs=$((_manifs + 1))
+    [[ -f "$HOME/.config/$_cfg/NativeMessagingHosts/com.cocoon.open_external.json" ]] && _manifs=$((_manifs + 1))
   done
   if [[ -n "$_extdir" ]]; then
     echo "  ok: router extension shipped ($_extdir)"
@@ -589,25 +765,32 @@ deps() {
       printf '  missing (optional): %s\n' "$c"
     fi
   done
-  printf '  distro: %s | compositor: %s\n' "$(declare -F webapp_distro >/dev/null 2>&1 && webapp_distro || echo unknown)" "$(compositor)"
+  if [[ "$flatpak_pin" != "true" ]]; then
+    if command -v flatpak >/dev/null 2>&1; then
+      echo "  ok: flatpak (optional; needed only for flatpak:<app-id> pins)"
+    else
+      echo "  missing (optional): flatpak (needed only for flatpak:<app-id> pins)"
+    fi
+  fi
+  printf '  distro: %s | compositor: %s\n' "$(declare -F cocoon_distro >/dev/null 2>&1 && cocoon_distro || echo unknown)" "$(compositor)"
   echo "== shell environment sanity (inherited, before scripts sanitize) =="
   if [[ "$INHERITED_IFS" == "__UNSET__" || "$INHERITED_IFS" == *' '* ]]; then
     echo "  ok: IFS default (word splitting intact)"
   else
     echo "  WARN: inherited IFS has no space — breaks unquoted expansions in"
     echo "        ANY shell script (this installer saga started exactly here);"
-    echo "        webapp-* scripts unset IFS defensively, check your dotfiles."
+    echo "        cocoon-* scripts unset IFS defensively, check your dotfiles."
   fi
   if [[ "$INHERITED_GLOBIGNORE" == "__UNSET__" || -z "$INHERITED_GLOBIGNORE" ]]; then
     echo "  ok: GLOBIGNORE unset"
   else
-    echo "  info: GLOBIGNORE is set to '$INHERITED_GLOBIGNORE' (webapp scripts are immune: find-based scans)"
+    echo "  info: GLOBIGNORE is set to '$INHERITED_GLOBIGNORE' (cocoon scripts are immune: find-based scans)"
   fi
   echo "== shell PATH wiring (is the toolkit on PATH after a fresh login?) =="
   # Own dir covers custom --prefix installs; default dir covers the standard
   # layout (either one wired is fine).
   _owndir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  _defdir="$HOME/.local/share/webapps/bin"
+  _defdir="$HOME/.local/share/cocoon/bin"
   printf '  login shell: %s\n' "${SHELL:-unknown}"
   if [[ ":$PATH:" == *":$_owndir:"* ]]; then
     echo "  ok: toolkit bin dir on PATH in this shell"
@@ -626,11 +809,11 @@ deps() {
     echo "  WARN: no PATH wiring found in ~/.bashrc, ~/.zshrc, or fish config.fish (re-run install.sh)"
   fi
   if [[ "${SHELL:-}" == *fish* ]] && ! grep -q -F -e "$_owndir" -e "$_defdir" "$HOME/.config/fish/config.fish" 2>/dev/null; then
-    echo "  WARN: login shell is fish but config.fish has no webapp-kit PATH block (re-run install.sh)"
+    echo "  WARN: login shell is fish but config.fish has no Cocoon PATH block (re-run install.sh)"
   fi
   if [[ -n "${missing_hard// }" ]]; then
-    if declare -F webapp_install_cmd >/dev/null 2>&1; then
-      hint="$(webapp_install_cmd "${missing_hard# }")"
+    if declare -F cocoon_install_cmd >/dev/null 2>&1; then
+      hint="$(cocoon_install_cmd "${missing_hard# }")"
       [[ -n "$hint" ]] && echo "install: $hint"
     fi
     return 1
@@ -641,26 +824,29 @@ deps() {
 # orphans_json: emit orphan paths as a JSON string array (no warnings here;
 # caller counts them).
 orphans_json() {
-  local first=true d base found n f
+  local first=true d base found n f root
   printf '['
-  for d in "$DATA_ROOT"/firefox-* "$DATA_ROOT"/chrome-*; do
-    [[ -e "$d" ]] || continue
-    base="$(basename "$d")"
-    found=0
-    while IFS= read -r -d '' f; do
-      if grep -q '^Exec=.*webapp-launch-' "$f" 2>/dev/null; then
-        n="$(basename "${f%.desktop}")"
-        if [[ "$(slugify "$n")" == "${base#*-}" ]]; then found=1; break; fi
+  for root in "${DATA_ROOTS[@]}"; do
+    [[ -n "$root" ]] || continue
+    for d in "$root"/firefox-* "$root"/chrome-*; do
+      [[ -e "$d" ]] || continue
+      base="$(basename "$d")"
+      found=0
+      while IFS= read -r -d '' f; do
+        if grep -Eq '^Exec=.*(cocoon-launch-|cocoon launch (chrome|firefox))' "$f" 2>/dev/null; then
+          n="$(basename "${f%.desktop}")"
+          if [[ "$(slugify "$n")" == "${base#*-}" ]]; then found=1; break; fi
+        fi
+      done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
+      if [[ "$found" == "0" ]]; then
+        $first || printf ','
+        first=false
+        printf '"%s"' "$(json_escape "$d")"
+        JSON_ISSUES+=("orphan data dir without .desktop: $d")
       fi
-    done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
-    if [[ "$found" == "0" ]]; then
-      $first || printf ','
-      first=false
-      printf '"%s"' "$(json_escape "$d")"
-      JSON_ISSUES+=("orphan data dir without .desktop: $d")
-    fi
+    done
   done
-  for d in "$HOME"/.config/mozilla/firefox/*-webapp "$HOME"/.mozilla/firefox/*-webapp; do
+  for d in "$HOME"/.config/mozilla/firefox/*-cocoon "$HOME"/.mozilla/firefox/*-cocoon; do
     [[ -d "$d" ]] || continue
     $first || printf ','
     first=false
@@ -673,22 +859,25 @@ orphans_json() {
 PROBE=false
 DEPS=false
 JSON=false
+FIX=false
 NAMES=()
 while (($# > 0)); do
   case "$1" in
     --probe) PROBE=true; shift ;;
     --deps) DEPS=true; shift ;;
     --json) JSON=true; shift ;;
+    --fix) FIX=true; shift ;;
     --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
     -h | --help)
-      echo "Usage: webapp-doctor [name...]"
-      echo "       webapp-doctor --probe [name]   # live window identity (auto backend)"
-      echo "       webapp-doctor --deps           # dependency check with install hints"
-      echo "       webapp-doctor --json [name...] # machine-readable report"
+      echo "Usage: cocoon-doctor [name...]"
+      echo "       cocoon-doctor --probe [name]   # live window identity (auto backend)"
+      echo "       cocoon-doctor --deps           # dependency check with install hints"
+      echo "       cocoon-doctor --fix [name...]  # repair fixable issues (icon, KWin rule, pref)"
+      echo "       cocoon-doctor --json [name...] # machine-readable report"
       exit 0
       ;;
     --) shift; while (($# > 0)); do NAMES+=("$1"); shift; done; break ;;
-    -*) echo "webapp-doctor: unknown flag: $1" >&2; exit 1 ;;
+    -*) echo "cocoon-doctor: unknown flag: $1" >&2; exit 1 ;;
     *) NAMES+=("$1"); shift ;;
   esac
 done
@@ -708,10 +897,60 @@ collect_names() {
   if ((${#NAMES[@]} == 0)); then
     mapfile -t NAMES < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null |
       while IFS= read -r -d '' f; do
-        grep -q '^Exec=.*webapp-launch-' "$f" 2>/dev/null && basename "${f%.desktop}"
+        grep -Eq '^Exec=.*(cocoon-launch-|cocoon launch (chrome|firefox))' "$f" 2>/dev/null && basename "${f%.desktop}"
       done | sort)
   fi
 }
+fix_app() {
+  local name="$1" desktop="$DESKTOP_DIR/$1.desktop"
+  [[ -f "$desktop" ]] || return 0
+  local exec_line="" icon="" slug="" engine="custom" url="" browser="" pattern=""
+  exec_line="$(sed -n 's/^Exec=//p' "$desktop" | head -n1 || true)"
+  icon="$(sed -n 's/^Icon=//p' "$desktop" | head -n1 || true)"
+  slug="$(slugify "$name")"
+  [[ "$exec_line" == *"cocoon-launch-chrome"* || "$exec_line" == *" launch chrome "* ]] && engine="chrome"
+  [[ "$exec_line" == *"cocoon-launch-firefox"* || "$exec_line" == *" launch firefox "* ]] && engine="firefox"
+
+  if [[ -n "$icon" && ! -f "$HOME/.local/share/icons/hicolor/128x128/apps/$icon.png" ]]; then
+    echo "fix: refreshing icon for '$name'"
+    bash "$MODULE_DIR/cocoon-icon" "$name" >/dev/null 2>&1 || true
+  fi
+
+  if [[ "$engine" == "chrome" && "$(compositor)" == "plasma" && -f "$MODULE_DIR/cocoon-kwin.sh" ]]; then
+    url="$(printf '%s' "$exec_line" | sed -n 's/.*--url "\([^"]*\)".*/\1/p;s/.*--url \([^ "]*\).*/\1/p' | head -n1 || true)"
+    if [[ -n "$url" ]]; then
+      # shellcheck disable=SC1090
+      source "$MODULE_DIR/cocoon-kwin.sh"
+      pattern="($(cocoon_regex_escape "$slug")|$(cocoon_regex_escape "$(cocoon_chrome_id "$url")"))"
+      kwin_rule_remove "$name" >/dev/null 2>&1 || true
+      kwin_rule_add "$name" "$name" "$pattern" >/dev/null 2>&1 || true
+      kwin_reconfigure || true
+      echo "fix: refreshed KWin rule for '$name'"
+    fi
+  fi
+
+  local pdir
+  pdir="$(cocoon_profile_path firefox "$slug")"
+  if [[ "$engine" == "firefox" && -d "$pdir" ]]; then
+    mkdir -p "$pdir/chrome" 2>/dev/null || true
+    if ! grep -q 'toolkit.legacyUserProfileCustomizations.stylesheets' "$pdir/user.js" 2>/dev/null; then
+      printf 'user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);\n' >>"$pdir/user.js" 2>/dev/null || true
+      echo "fix: enabled userChrome stylesheets for '$name'"
+    fi
+  fi
+}
+
+if [[ "$FIX" == "true" ]]; then
+  collect_names
+  if ((${#NAMES[@]} == 0)); then echo "doctor: no apps to fix"; exit 0; fi
+  for n in "${NAMES[@]}"; do fix_app "$n"; done
+  echo "doctor: repairs attempted; re-running checks..."
+  ISSUES=0
+  for n in "${NAMES[@]}"; do check_app "$n"; done
+  echo "doctor: $ISSUES warning(s) remain"
+  exit "$([ "$ISSUES" == "0" ] && echo 0 || echo 1)"
+fi
+
 if [[ "$JSON" == "true" ]]; then
   collect_names
   JSON_ISSUES=()
@@ -728,7 +967,7 @@ if [[ "$JSON" == "true" ]]; then
 fi
 collect_names
 if ((${#NAMES[@]} == 0)); then
-  echo "(no webapps installed)"
+  echo "(no cocoon installed)"
 fi
 for n in "${NAMES[@]}"; do check_app "$n"; done
 check_orphans

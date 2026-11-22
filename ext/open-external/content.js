@@ -1,12 +1,12 @@
-// webapp-kit link router — content script (document_start, top frame only).
-// Rule: EVERY http(s) link activation leaves the isolated webapp window and
+// Cocoon link router — content script (document_start, top frame only).
+// Rule: EVERY http(s) link activation leaves the isolated cocoon window and
 // opens in the system default browser via the native host (xdg-open).
-// The webapp window itself only ever shows its pinned start URL (+ in-page
+// The cocoon window itself only ever shows its pinned start URL (+ in-page
 // JS-router state, which performs no real navigation).
 //
 // window.open() is handled by the sibling MAIN-world script (inject.js): a
 // content script runs in an isolated world, so patching window.open HERE
-// would never affect the page. inject.js posts {__webappkitRouter:1} back to
+// would never affect the page. inject.js posts {__cocoonRouter:1} back to
 // this world, which owns the native-host bridge.
 //
 // If the native host is unreachable (manifest not installed), fall back to
@@ -33,7 +33,7 @@ function askHost(url, onDone) {
     }
   }, HOST_OK_TIMEOUT_MS);
   try {
-    chrome.runtime.sendMessage({ type: 'webappkit-open', url }, () => {
+    chrome.runtime.sendMessage({ type: 'cocoon-open', url }, () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -122,7 +122,10 @@ document.addEventListener(
 window.addEventListener('message', (event) => {
   if (event.source !== window) return;
   const data = event.data;
-  if (!data || data.__webappkitRouter !== 1 || data.kind !== 'open') return;
+  if (!data || data.__cocoonRouter !== 1 || data.kind !== 'open') return;
+  // The nonce is planted by inject.js in the DOM (shared between JS worlds).
+  const nonce = document.documentElement.getAttribute('data-cocoon-router');
+  if (!nonce || data.nonce !== nonce) return;
   if (typeof data.url !== 'string') return;
   let url;
   try {

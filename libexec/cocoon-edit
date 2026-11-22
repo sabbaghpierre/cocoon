@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# cocoon-edit — change an installed web app without losing its isolated profile.
+# Supported changes: start URL, pinned browser, icon, MIME types. The profile
+# directory (and therefore all logins) is never touched.
+set -euo pipefail
+unset IFS GLOBIGNORE
+
+MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DESKTOP_DIR="$HOME/.local/share/applications"
+HICOLOR_DIR="$HOME/.local/share/icons/hicolor/128x128/apps"
+
+NEW_URL=""
+NEW_BROWSER=""
+NEW_ICON=""
+NEW_MIME=""
+CLEAR_MIME=false
+
+usage() {
+  cat <<EOF
+Usage: cocoon edit <name> [--url URL] [--browser ID|PATH] [--icon REF] [--mime TYPES] [--no-mime]
+  --icon REF   PNG file, http(s) URL, or bare name; omit REF's value to re-fetch the favicon.
+  The app's browser profile and logins are preserved.
+EOF
+}
+
+if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then usage; exit 0; fi
+NAME="$1"; shift
+while (($# > 0)); do
+  case "$1" in
+    --url) NEW_URL="${2:?--url needs a value}"; shift 2 ;;
+    --browser) NEW_BROWSER="${2:?--browser needs a value}"; shift 2 ;;
+    --icon)
+      if [[ -z "${2:-}" || "$2" == --* ]]; then NEW_ICON="__FETCH__"; shift
+      else NEW_ICON="$2"; shift 2
+      fi
+      ;;
+    --mime) NEW_MIME="${2:?--mime needs a value}"; shift 2 ;;
+    --no-mime) CLEAR_MIME=true; shift ;;
+    *) echo "cocoon edit: unknown flag: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+DESKTOP="$DESKTOP_DIR/$NAME.desktop"
+[[ -f "$DESKTOP" ]] || { echo "cocoon edit: no app named '$NAME' (run 'cocoon list')" >&2; exit 1; }
+
+unescape_field() {
+  printf '%s' "$1" | sed -e 's/\\\\/\\/g' -e 's/\\"/"/g' -e 's/\\\$/$/g' -e 's/\\`/`/g' -e 's/%%/%/g'
+}
+escape_field() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//\$/\\\$}"; s="${s//\`/\\\`}"; s="${s//%/%%}"
+  printf '%s' "$s"
+}
+
+# parse_browser <exec-line> -> pinned --browser id or path (spaces allowed).
+parse_browser() {
+  local line="$1" val=""
+  if [[ "$line" =~ --browser[[:space:]]+\"(([^\"\\]|\\.)*)\" ]]; then
+    val="${BASH_REMATCH[1]}"
+  elif [[ "$line" =~ --browser[[:space:]]+([^[:space:]\"]+) ]]; then
+    val="${BASH_REMATCH[1]}"
+  fi
+  unescape_field "$val"
+}
+
+exec_line="$(sed -n 's/^Exec=//p' "$DESKTOP" | head -n1 || true)"
+url="$(printf '%s' "$exec_line" | sed -n 's/.*--url "\([^"]*\)".*/\1/p;s/.*--url \([^ "]*\).*/\1/p' | head -n1 || true)"
+browser="$(parse_browser "$exec_line")"
+app_name="$(unescape_field "$(sed -n 's/^Name=//p' "$DESKTOP" | head -n1)")"
+engine="custom"
+[[ "$exec_line" == *"cocoon-launch-chrome"* || "$exec_line" == *" launch chrome "* ]] && engine="chrome"
+[[ "$exec_line" == *"cocoon-launch-firefox"* || "$exec_line" == *" launch firefox "* ]] && engine="firefox"
+url="$(unescape_field "$url")"
+
+[[ "$engine" == "custom" ]] && { echo "cocoon edit: cannot edit custom-Exec app '$NAME'" >&2; exit 1; }
+if [[ -z "$NEW_URL" && -z "$NEW_BROWSER" && -z "$NEW_ICON" && -z "$NEW_MIME" && "$CLEAR_MIME" != "true" ]]; then
+  usage; exit 0
+fi
+if [[ -n "$NEW_URL" ]]; then
+  [[ "$NEW_URL" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]] || NEW_URL="https://$NEW_URL"
+  url="$NEW_URL"
+fi
+if [[ -n "$NEW_BROWSER" ]]; then
+  # Flatpak pins must be strict, known, installed `flatpak:<app-id>` ids;
+  # free-form `flatpak run ...` strings are never accepted. Other values keep
+  # the legacy behavior (native ids and custom paths are left untouched).
+  if [[ "$NEW_BROWSER" == flatpak:* || "$NEW_BROWSER" == flatpak[[:space:]]* ]]; then
+    _app="${NEW_BROWSER#flatpak:}"
+    if [[ ! "$_app" =~ ^[A-Za-z0-9_.-]+$ || "$_app" != *.* ]]; then
+      echo "cocoon edit: invalid flatpak browser id '$NEW_BROWSER'" >&2
+      exit 1
+    fi
+    if [[ -f "$MODULE_DIR/cocoon-browsers" ]]; then
+      # shellcheck disable=SC1090
+      source "$MODULE_DIR/cocoon-browsers" 2>/dev/null || true
+    fi
+    if declare -F cocoon_browser_known >/dev/null 2>&1 &&
+      ! cocoon_browser_known "$NEW_BROWSER"; then
+      echo "cocoon edit: unknown flatpak browser '$NEW_BROWSER' (run 'cocoon browsers')" >&2
+      exit 1
+    fi
+    if declare -F cocoon_browser_flatpak_installed >/dev/null 2>&1 &&
+      ! cocoon_browser_flatpak_installed "$_app"; then
+      echo "cocoon edit: flatpak app '$_app' is not installed" >&2
+      exit 1
+    fi
+  fi
+  browser="$NEW_BROWSER"
+fi
+
+# Favicon URL: hostname only (never leak paths/tokens to Google).
+urlencode() {
+  local s="$1" out="" i c hex
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+favicon_host() {
+  local u="${1#*://}"
+  u="${u%%\?*}"; u="${u%%#*}"; u="${u%%/*}"; u="${u##*@}"
+  if [[ "$u" == \[*\]* ]]; then u="${u#\[}"; u="${u%%\]*}"; else u="${u%%:*}"; fi
+  printf '%s' "$u"
+}
+slug="$(printf '%s' "$app_name" | tr ' ' '-' | tr -c '[:alnum:]-_.' '-' | sed -e 's/-\{2,\}/-/g' -e 's/^[-.]//' -e 's/[-.]$//')"
+[[ -z "$slug" ]] && slug="app"
+
+if [[ -n "$NEW_ICON" ]]; then
+  tmp_icon="$(mktemp /tmp/cocoon-icon-XXXXXX.png)"
+  if [[ "$NEW_ICON" == "__FETCH__" ]]; then
+    if ! curl -fsSL --max-time 15 -o "$tmp_icon" "https://www.google.com/s2/favicons?domain=$(urlencode "$(favicon_host "$url")")&sz=128" || [[ ! -s "$tmp_icon" ]]; then
+      echo "cocoon edit: could not fetch favicon; pass an icon URL/file" >&2; rm -f "$tmp_icon"; exit 1
+    fi
+  elif [[ "$NEW_ICON" =~ ^https?:// ]]; then
+    if ! curl -fsSL --max-time 15 -o "$tmp_icon" "$NEW_ICON" || [[ ! -s "$tmp_icon" ]]; then
+      echo "cocoon edit: could not download icon" >&2; rm -f "$tmp_icon"; exit 1
+    fi
+  elif [[ -f "$NEW_ICON" ]]; then
+    rm -f "$tmp_icon"; tmp_icon=""
+    cp -f "$NEW_ICON" "$HICOLOR_DIR/$slug.png" && chmod 644 "$HICOLOR_DIR/$slug.png"
+  else
+    echo "cocoon edit: icon file not found: $NEW_ICON" >&2; rm -f "$tmp_icon"; exit 1
+  fi
+  if [[ -n "$tmp_icon" ]]; then
+    if command -v file >/dev/null 2>&1 && ! file -b "$tmp_icon" | grep -qi image; then
+      echo "cocoon edit: icon is not an image" >&2; rm -f "$tmp_icon"; exit 1
+    fi
+    cp -f "$tmp_icon" "$HICOLOR_DIR/$slug.png" && chmod 644 "$HICOLOR_DIR/$slug.png"
+    rm -f "$tmp_icon"
+  fi
+fi
+
+# Rebuild desktop file from the parsed values (no fragile line-level edits).
+prefix_part="${exec_line%% --name *}"
+prefix_part="$(printf '%s' "$prefix_part" | sed -E 's/ --browser "[^"]*"//')"
+if [[ -n "$browser" ]]; then prefix_part="$prefix_part --browser \"$(escape_field "$browser")\""; fi
+new_exec="$prefix_part --name \"$(escape_field "$app_name")\" --url \"$(escape_field "$url")\""
+[[ "$exec_line" == *"%u"* ]] && new_exec="$new_exec %u"
+
+wm_class="$(sed -n 's/^StartupWMClass=//p' "$DESKTOP" | head -n1)"
+icon_line="$(sed -n 's/^Icon=/Icon=/p' "$DESKTOP" | head -n1)"
+comment="$(sed -n 's/^Comment=//p' "$DESKTOP" | head -n1)"
+categories="$(sed -n 's/^Categories=//p' "$DESKTOP" | head -n1)"
+keywords="$(sed -n 's/^Keywords=//p' "$DESKTOP" | head -n1)"
+
+mime_line=""
+if [[ "$CLEAR_MIME" == "true" ]]; then
+  :
+elif [[ -n "$NEW_MIME" ]]; then
+  [[ "$NEW_MIME" == *";" ]] || NEW_MIME="${NEW_MIME};"
+  mime_line="MimeType=$NEW_MIME"
+else
+  mime_line="$(sed -n 's/^MimeType=/MimeType=/p' "$DESKTOP" | head -n1)"
+fi
+
+tmp_desktop="$(mktemp "$DESKTOP_DIR/.cocoon-edit.XXXXXX")" || exit 1
+{
+  printf '[Desktop Entry]\nVersion=1.0\nName=%s\n' "$(escape_field "$app_name")"
+  [[ -n "$comment" ]] && printf 'Comment=%s\n' "$comment"
+  printf 'Exec=%s\nTerminal=false\nType=Application\n' "$new_exec"
+  [[ -n "$icon_line" ]] && printf '%s\n' "$icon_line"
+  printf 'StartupNotify=true\nStartupWMClass=%s\n' "$wm_class"
+  [[ -n "$categories" ]] && printf 'Categories=%s\n' "$categories"
+  [[ -n "$keywords" ]] && printf 'Keywords=%s\n' "$keywords"
+  printf 'Actions=open-browser;\n'
+  [[ -n "$mime_line" ]] && printf '%s\n' "$mime_line"
+  printf '\n[Desktop Action open-browser]\nName=Open in default browser\nExec=xdg-open "%s"\n' "$(escape_field "$url")"
+} >"$tmp_desktop"
+chmod +x "$tmp_desktop" && mv -f "$tmp_desktop" "$DESKTOP"
+
+# Chrome WM class is derived from the URL host: refresh the KWin rule if the
+# URL changed. Firefox uses the stable slug and needs no change.
+if [[ "$engine" == "chrome" && -n "$NEW_URL" ]] && [[ -f "$MODULE_DIR/cocoon-kwin.sh" ]]; then
+  # shellcheck disable=SC1090
+  source "$MODULE_DIR/cocoon-kwin.sh"
+  new_id="$(cocoon_chrome_id "$url")"
+  kwin_rule_remove "$NAME" >/dev/null 2>&1 || true
+  kwin_rule_add "$NAME" "$app_name" "($(cocoon_regex_escape "$slug")|$(cocoon_regex_escape "$new_id"))" >/dev/null 2>&1 || true
+  sed -i "s/^StartupWMClass=.*/StartupWMClass=$new_id/" "$DESKTOP" || true
+  kwin_reconfigure || true
+fi
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+fi
+echo "Updated '$NAME'. Its profile and logins were not touched."

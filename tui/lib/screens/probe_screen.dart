@@ -1,4 +1,4 @@
-/// Probe screen: stream `webapp-doctor --probe` lines live.
+/// Probe screen: stream `cocoon doctor --probe` lines live.
 /// Enter starts (focus the app window first), s stops, Esc stops + back.
 library;
 
@@ -27,10 +27,16 @@ class _ProbeScreenState extends State<ProbeScreen> {
   String? error;
   bool probing = false;
 
+  @override
+  void dispose() {
+    unawaited(_stop(silent: true));
+    nameCtrl.dispose();
+    super.dispose();
+  }
+
   Future<void> _start() async {
     await _stop(silent: true);
-    final name =
-        nameCtrl.text.trim().isEmpty ? null : nameCtrl.text.trim();
+    final name = nameCtrl.text.trim().isEmpty ? null : nameCtrl.text.trim();
     setState(() {
       samples.clear();
       error = null;
@@ -109,9 +115,10 @@ class _ProbeScreenState extends State<ProbeScreen> {
     final body = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Text('Probe live window (Enter: start · s: stop · Esc: back)',
-            style:
-                TextStyle(fontWeight: FontWeight.bold, color: Colors.yellow)),
+        const Text(
+          'Probe live window (Enter: start · s: stop · Esc: back)',
+          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.yellow),
+        ),
         const SizedBox(height: 1),
         TextField(
           key: const ValueKey('probe-name'),
@@ -123,15 +130,19 @@ class _ProbeScreenState extends State<ProbeScreen> {
         ),
         const SizedBox(height: 1),
         if (error != null)
-          Text('Error: $error',
-              style: const TextStyle(color: Colors.brightRed)),
+          Text(
+            'Error: $error',
+            style: const TextStyle(color: Colors.brightRed),
+          ),
         Expanded(
           child: ListView(
             keyboardScrollable: true,
             children: [
               if (samples.isEmpty && !probing)
-                const Text('No samples yet. Focus the app window, Enter to start.',
-                    style: TextStyle(color: Colors.brightBlack)),
+                const Text(
+                  'No samples yet. Focus the app window, Enter to start.',
+                  style: TextStyle(color: Colors.brightBlack),
+                ),
               for (final s in samples) _row(s, expectSlug),
             ],
           ),
@@ -159,8 +170,9 @@ class _ProbeScreenState extends State<ProbeScreen> {
     return Text(
       '${isMatch ? 'MATCH ' : ''}$text',
       style: TextStyle(
-          fontWeight: isMatch ? FontWeight.bold : null,
-          color: isMatch ? Colors.brightGreen : Colors.white),
+        fontWeight: isMatch ? FontWeight.bold : null,
+        color: isMatch ? Colors.brightGreen : Colors.white,
+      ),
     );
   }
 }

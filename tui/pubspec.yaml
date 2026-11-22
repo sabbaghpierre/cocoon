@@ -1,5 +1,5 @@
-name: webapp_tui
-description: Nocterm TUI frontend for the webapp-kit isolated-webapps toolkit.
+name: cocoon_tui
+description: Nocterm TUI frontend for the Cocoon isolated-webapps CLI.
 version: 0.0.2
 
 environment:

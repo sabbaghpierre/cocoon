@@ -26,6 +26,11 @@ class _DoctorScreenState extends State<DoctorScreen> {
     _load();
   }
 
+  @override
+  void dispose() {
+    super.dispose();
+  }
+
   Future<void> _load() async {
     setState(() {
       report = null;
@@ -65,13 +70,19 @@ class _DoctorScreenState extends State<DoctorScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Text('Doctor (r: refresh · Esc: back)',
-                style: TextStyle(
-                    fontWeight: FontWeight.bold, color: Colors.yellow)),
+            const Text(
+              'Doctor (r: refresh · Esc: back)',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: Colors.yellow,
+              ),
+            ),
             const SizedBox(height: 1),
             if (err != null)
-              Text('Error: $err',
-                  style: const TextStyle(color: Colors.brightRed))
+              Text(
+                'Error: $err',
+                style: const TextStyle(color: Colors.brightRed),
+              )
             else if (rep == null)
               const Text('Checking…')
             else if (rep.apps.isEmpty && rep.orphans.isEmpty)
@@ -83,9 +94,10 @@ class _DoctorScreenState extends State<DoctorScreen> {
                   children: [
                     for (final app in rep.apps) ..._appRows(app),
                     for (final orphan in rep.orphans)
-                      Text('orphan: $orphan',
-                          style:
-                              const TextStyle(color: Colors.brightRed)),
+                      Text(
+                        'orphan: $orphan',
+                        style: const TextStyle(color: Colors.brightRed),
+                      ),
                   ],
                 ),
               ),
@@ -96,9 +108,8 @@ class _DoctorScreenState extends State<DoctorScreen> {
                     ? 'all green'
                     : '${rep.issueCount} warning(s)',
                 style: TextStyle(
-                    color: rep.issueCount == 0
-                        ? Colors.green
-                        : Colors.brightRed),
+                  color: rep.issueCount == 0 ? Colors.green : Colors.brightRed,
+                ),
               ),
             ],
           ],
@@ -112,8 +123,9 @@ class _DoctorScreenState extends State<DoctorScreen> {
       Text(
         '${app.healthy ? 'ok' : 'WARN'} ${app.name} [${app.engine}]${app.live ? ' (running)' : ''}',
         style: TextStyle(
-            fontWeight: FontWeight.bold,
-            color: app.healthy ? Colors.green : Colors.brightRed),
+          fontWeight: FontWeight.bold,
+          color: app.healthy ? Colors.green : Colors.brightRed,
+        ),
       ),
     ];
     for (final issue in app.issues) {

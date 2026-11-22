@@ -13,16 +13,16 @@ import 'screens/remove_screen.dart';
 
 enum AppScreen { dashboard, create, remove, doctor, probe, help }
 
-class WebAppTui extends StatefulComponent {
+class CocoonTui extends StatefulComponent {
   final Backend backend;
 
-  WebAppTui({super.key, Backend? backend}) : backend = backend ?? Backend();
+  CocoonTui({super.key, Backend? backend}) : backend = backend ?? Backend();
 
   @override
-  State<WebAppTui> createState() => _WebAppTuiState();
+  State<CocoonTui> createState() => _CocoonTuiState();
 }
 
-class _WebAppTuiState extends State<WebAppTui> {
+class _CocoonTuiState extends State<CocoonTui> {
   AppScreen screen = AppScreen.dashboard;
 
   void go(AppScreen next) => setState(() => screen = next);
@@ -32,10 +32,7 @@ class _WebAppTuiState extends State<WebAppTui> {
     final backend = component.backend;
     switch (screen) {
       case AppScreen.dashboard:
-        return DashboardScreen(
-          backend: backend,
-          onOpen: go,
-        );
+        return DashboardScreen(backend: backend, onOpen: go);
       case AppScreen.create:
         return CreateScreen(
           backend: backend,

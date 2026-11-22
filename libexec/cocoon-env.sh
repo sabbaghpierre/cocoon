@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# webapp-env.sh — distro + compositor detection for the webapp-* toolkit.
-# Sourced (not executed) by the webapp-* scripts. All functions degrade
+# cocoon-env.sh — distro + compositor detection for the cocoon-* toolkit.
+# Sourced (not executed) by the cocoon-* scripts. All functions degrade
 # gracefully when detection tools are missing.
 
-# WEBAPP_OS_RELEASE override exists for testing (default: /etc/os-release).
-# webapp_compositor — print plasma|niri|hyprland|sway|gnome|unknown.
+# COCOON_OS_RELEASE override exists for testing (default: /etc/os-release).
+# cocoon_compositor — print plasma|niri|hyprland|sway|gnome|unknown.
 # Prefers the actually-running compositor; falls back to XDG_CURRENT_DESKTOP.
-webapp_compositor() {
+cocoon_compositor() {
   if command -v pgrep >/dev/null 2>&1; then
     pgrep -x kwin_wayland >/dev/null 2>&1 && { printf 'plasma'; return; }
     pgrep -x kwin_x11 >/dev/null 2>&1 && { printf 'plasma'; return; }
@@ -25,19 +25,19 @@ webapp_compositor() {
   esac
 }
 
-# webapp_distro — print os-release ID (void, arch, fedora, ...) or unknown.
-webapp_distro() (
+# cocoon_distro — print os-release ID (void, arch, fedora, ...) or unknown.
+cocoon_distro() (
   # subshell: sourcing os-release must not leak variables into callers.
-  OS_RELEASE_FILE="${WEBAPP_OS_RELEASE:-/etc/os-release}"
+  OS_RELEASE_FILE="${COCOON_OS_RELEASE:-/etc/os-release}"
   # shellcheck disable=SC1090
   [[ -f "$OS_RELEASE_FILE" ]] && source "$OS_RELEASE_FILE" 2>/dev/null
   printf '%s' "${ID:-unknown}"
 )
 
-# webapp_install_cmd <pkgs...> — print the distro's install command, or empty.
-webapp_install_cmd() {
+# cocoon_install_cmd <pkgs...> — print the distro's install command, or empty.
+cocoon_install_cmd() {
   local pkgs="$*"
-  case "$(webapp_distro)" in
+  case "$(cocoon_distro)" in
     void) printf 'sudo xbps-install -S %s' "$pkgs" ;;
     arch | endeavouros | manjaro | cachyos | artix) printf 'sudo pacman -S %s' "$pkgs" ;;
     fedora | nobara | rhel | centos | rocky | almalinux) printf 'sudo dnf install %s' "$pkgs" ;;

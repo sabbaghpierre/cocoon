@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+# cocoon-browsers — detect installed browsers for isolated cocoon.
+#
+# Single source of truth for browser detection. Every other cocoon-* script
+# should source this file (for the candidate tables + helpers) or call it
+# as a CLI (for human / TUI consumption) instead of hardcoding binary names.
+#
+# Detection model:
+#   engine chromium = any binary speaking Chromium SSB flags
+#     (--app --user-data-dir --class). Backs cocoon-launch-chrome.
+#   engine firefox  = any Gecko binary speaking Firefox profile flags
+#     (--profile --no-remote --new-window --name --class) + user.js /
+#     chrome/userChrome.css isolation. Backs cocoon-launch-firefox.
+#     (LibreWolf / Zen / Floorp / Waterfox are full Gecko builds, so they
+#     are fully supported — same flags, same profile layout. Tor Browser
+#     is deliberately excluded: its sandbox fights --profile reuse.)
+#   Flatpak browsers are fully launchable: their id is `flatpak:<app-id>`,
+#   their engine comes from the _cocoon_flatpak_map table, and launchers build
+#   a `flatpak run --filesystem=... <app-id>` argv prefix from
+#   cocoon_browser_launch_argv (never exec the id string itself).
+#
+# Usage:
+#   cocoon-browsers                  # human table (native + flatpak)
+#   cocoon-browsers --json           # [{"id","engine","bin","name","version","source","supported"}]
+#   cocoon-browsers --list           # plain ids, one per line (native only)
+#   cocoon-browsers --engine chromium|firefox [--json|--list]
+#   cocoon-browsers --all            # include flatpak ids in --list too
+#   cocoon-browsers --default chromium|firefox  # print default binary id or empty
+#   cocoon-browsers --probe <path> [--json]      # engine of a custom binary
+#   Sourcing: source cocoon-browsers (functions only, no output; safe to
+#   source twice). Uses cocoon_browser_* namespace to avoid collisions.
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+_cocoon_browsers_cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+# ---- candidate tables (ordered: first found = default) ----
+_COCOON_CHROMIUM_CANDIDATES=(
+  google-chrome-stable google-chrome google-chrome-beta google-chrome-unstable
+  chromium chromium-browser ungoogled-chromium
+  brave-browser brave brave-beta
+  vivaldi-stable vivaldi vivaldi-snapshot
+  microsoft-edge-stable microsoft-edge microsoft-edge-beta
+  opera opera-beta
+  thorium-browser thorium
+)
+_COCOON_FIREFOX_CANDIDATES=(
+  firefox firefox-esr firefox-beta firefox-developer-edition
+  librewolf zen-browser zen floorp waterfox
+)
+
+# ---- Flatpak helpers -------------------------------------------------------
+# cocoon_browser_is_flatpak <val> -> true when val uses the flatpak: id scheme.
+cocoon_browser_is_flatpak() {
+  [[ "${1:-}" == flatpak:* ]]
+}
+
+# cocoon_browser_flatpak_app <id> -> strict app-id suffix of a flatpak: id,
+# or nothing (non-zero) for a malformed id. Never returns free-form run args.
+cocoon_browser_flatpak_app() {
+  local val="${1:-}" app
+  cocoon_browser_is_flatpak "$val" || return 1
+  app="${val#flatpak:}"
+  [[ "$app" =~ ^[A-Za-z0-9_.-]+$ && "$app" == *.* ]] || return 1
+  printf '%s' "$app"
+}
+
+# cocoon_browser_flatpak_installed <app-id> -> true when flatpak exists and the
+# app appears in `flatpak list --app --columns=application` (fallback: info).
+cocoon_browser_flatpak_installed() {
+  local app="${1:-}" listed line
+  [[ -n "$app" ]] || return 1
+  command -v flatpak >/dev/null 2>&1 || return 1
+  listed="$(flatpak list --app --columns=application 2>/dev/null || true)"
+  if [[ -n "$listed" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" == "$app" ]] && return 0
+    done <<<"$listed"
+    return 1
+  fi
+  flatpak info "$app" >/dev/null 2>&1
+}
+
+# cocoon_browser_launch_argv <id-or-path> [data-root] -> one LAUNCH argv
+# element per line (callers use `mapfile -t`). Native ids/paths resolve to one
+# absolute executable. Flatpak ids expand to the sandbox-safe run prefix:
+#   flatpak / run / --filesystem=<data-root> / [--env=MOZ_ENABLE_WAYLAND=1] / <app-id>
+# The id is always passed as a single, validated argv element after `run`.
+cocoon_browser_launch_argv() {
+  local val="${1:-}" data_root="${2:-}" app eng resolved
+  if cocoon_browser_is_flatpak "$val"; then
+    app="$(cocoon_browser_flatpak_app "$val")" || return 1
+    command -v flatpak >/dev/null 2>&1 || return 1
+    [[ -n "$(_cocoon_flatpak_map "$app" 2>/dev/null || true)" ]] || return 1
+    [[ -n "$data_root" ]] || data_root="$HOME/.local/share/cocoon"
+    printf 'flatpak\nrun\n--filesystem=%s\n' "$data_root"
+    eng="$(cocoon_browser_engine "$val" 2>/dev/null || true)"
+    if [[ "$eng" == "firefox" && -n "${WAYLAND_DISPLAY:-}" ]]; then
+      printf -- '--env=MOZ_ENABLE_WAYLAND=1\n'
+    fi
+    printf '%s\n' "$app"
+    return 0
+  fi
+  resolved="$(cocoon_browser_resolve "$val" 2>/dev/null || true)"
+  [[ -n "$resolved" ]] || return 1
+  printf '%s\n' "$resolved"
+}
+
+# cocoon_browser_engine <id> -> chromium|firefox|""
+cocoon_browser_engine() {
+  local id="$1" c app mapped
+  if cocoon_browser_is_flatpak "$id"; then
+    app="$(cocoon_browser_flatpak_app "$id" 2>/dev/null || true)"
+    [[ -n "$app" ]] || return 1
+    mapped="$(_cocoon_flatpak_map "$app" 2>/dev/null || true)"
+    [[ -n "$mapped" ]] || return 1
+    printf '%s' "${mapped#*$'\t'}"
+    return 0
+  fi
+  for c in ${_COCOON_CHROMIUM_CANDIDATES[@]+"${_COCOON_CHROMIUM_CANDIDATES[@]}"}; do
+    [[ "$c" == "$id" ]] && { printf 'chromium'; return 0; }
+  done
+  for c in ${_COCOON_FIREFOX_CANDIDATES[@]+"${_COCOON_FIREFOX_CANDIDATES[@]}"}; do
+    [[ "$c" == "$id" ]] && { printf 'firefox'; return 0; }
+  done
+  printf ''
+  return 1
+}
+
+# cocoon_browser_known <id> -> true if in either table
+cocoon_browser_known() {
+  [[ -n "$(cocoon_browser_engine "$1" || true)" ]]
+}
+
+# cocoon_browser_display_name <id> -> human label
+cocoon_browser_display_name() {
+  local id="$1" app mapped bid
+  if cocoon_browser_is_flatpak "$id"; then
+    app="$(cocoon_browser_flatpak_app "$id" 2>/dev/null || true)"
+    mapped="$(_cocoon_flatpak_map "$app" 2>/dev/null || true)"
+    if [[ -n "$mapped" ]]; then
+      bid="${mapped%%$'\t'*}"
+    else
+      bid="${id#flatpak:}"
+    fi
+    printf '%s (Flatpak)' "$(cocoon_browser_display_name "$bid")"
+    return 0
+  fi
+  case "$id" in
+    google-chrome-stable | google-chrome) printf 'Google Chrome' ;;
+    google-chrome-beta) printf 'Google Chrome Beta' ;;
+    google-chrome-unstable) printf 'Google Chrome Unstable' ;;
+    chromium | chromium-browser) printf 'Chromium' ;;
+    ungoogled-chromium) printf 'Ungoogled Chromium' ;;
+    brave-browser | brave) printf 'Brave' ;;
+    brave-beta) printf 'Brave Beta' ;;
+    vivaldi-stable | vivaldi) printf 'Vivaldi' ;;
+    vivaldi-snapshot) printf 'Vivaldi Snapshot' ;;
+    microsoft-edge-stable | microsoft-edge) printf 'Microsoft Edge' ;;
+    microsoft-edge-beta) printf 'Microsoft Edge Beta' ;;
+    opera | opera-beta) printf 'Opera' ;;
+    thorium-browser | thorium) printf 'Thorium' ;;
+    firefox) printf 'Firefox' ;;
+    firefox-esr) printf 'Firefox ESR' ;;
+    firefox-beta) printf 'Firefox Beta' ;;
+    firefox-developer-edition) printf 'Firefox Developer Edition' ;;
+    librewolf) printf 'LibreWolf' ;;
+    zen-browser | zen) printf 'Zen Browser' ;;
+    floorp) printf 'Floorp' ;;
+    waterfox) printf 'Waterfox' ;;
+    *) printf '%s' "$id" ;;
+  esac
+}
+
+# cocoon_browser_config_dir <id> -> relative Chromium config dir for that
+# browser (under $HOME/.config), or empty if not a known Chromium binary.
+# Lets callers place native-messaging hosts only where the browser will look.
+cocoon_browser_config_dir() {
+  local id="$1" app mapped bid
+  if cocoon_browser_is_flatpak "$id"; then
+    app="$(cocoon_browser_flatpak_app "$id" 2>/dev/null || true)"
+    mapped="$(_cocoon_flatpak_map "$app" 2>/dev/null || true)"
+    [[ -n "$mapped" ]] || { printf ''; return 0; }
+    bid="${mapped%%$'\t'*}"
+    cocoon_browser_config_dir "$bid"
+    return 0
+  fi
+  case "$id" in
+    google-chrome-stable | google-chrome | google-chrome-beta | google-chrome-unstable) printf 'google-chrome' ;;
+    chromium | chromium-browser | ungoogled-chromium | thorium-browser | thorium) printf 'chromium' ;;
+    brave-browser | brave | brave-beta) printf 'BraveSoftware/Brave-Browser' ;;
+    vivaldi-stable | vivaldi | vivaldi-snapshot) printf 'vivaldi' ;;
+    microsoft-edge-stable | microsoft-edge | microsoft-edge-beta) printf 'microsoft-edge' ;;
+    opera | opera-beta) printf 'opera' ;;
+    *) printf '' ;;
+  esac
+}
+
+# cocoon_browser_version <bin-or-flatpak-id> -> first line of --version, or
+# empty (never fails). A flatpak id is validated and passed as an argv element
+# to the literal `flatpak run` command; it is never executed as a command.
+cocoon_browser_version() {
+  local bin="$1" out="" app
+  if cocoon_browser_is_flatpak "$bin"; then
+    app="$(cocoon_browser_flatpak_app "$bin" 2>/dev/null || true)"
+    [[ -n "$app" ]] && command -v flatpak >/dev/null 2>&1 || { printf ''; return 0; }
+    if command -v timeout >/dev/null 2>&1; then
+      out="$(timeout 5 flatpak run "$app" --version 2>/dev/null | head -n1 || true)"
+    else
+      out="$(flatpak run "$app" --version 2>/dev/null | head -n1 || true)"
+    fi
+    printf '%s' "$out"
+    return 0
+  fi
+  if command -v "$bin" >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      out="$(timeout 5 "$bin" --version 2>/dev/null | head -n1 || true)"
+    else
+      out="$("$bin" --version 2>/dev/null | head -n1 || true)"
+    fi
+  fi
+  printf '%s' "$out"
+}
+
+# ---- custom binary helpers (side-effect-free, safe under set -e / set +e) ----
+# cocoon_browser_is_path <val> -> true when val looks like a path, not an id.
+cocoon_browser_is_path() {
+  [[ "${1:-}" == */* ]]
+}
+
+# cocoon_browser_resolve <id-or-path> -> absolute executable path; no output
+# and non-zero when it cannot be resolved. Handles relative paths and paths
+# containing spaces (callers MUST quote the value).
+cocoon_browser_resolve() {
+  local val="${1:-}" dir resolved
+  [[ -n "$val" ]] || return 1
+  if cocoon_browser_is_path "$val"; then
+    [[ -f "$val" && -x "$val" ]] || return 1
+    dir="${val%/*}"
+    [[ -n "$dir" ]] || dir="/"
+    resolved="$(cd "$dir" 2>/dev/null && pwd)" || return 1
+    printf '%s/%s' "$resolved" "${val##*/}"
+    return 0
+  fi
+  resolved="$(command -v "$val" 2>/dev/null || true)"
+  [[ -n "$resolved" ]] || return 1
+  printf '%s' "$resolved"
+}
+
+# cocoon_browser_probe_engine <path> -> chromium|firefox|"" (never fails).
+# A known basename is authoritative; otherwise identify the brand from the
+# --version output (always obtained through cocoon_browser_version, which
+# wraps the external call in `timeout 5 ... || true`).
+cocoon_browser_probe_engine() {
+  local path="${1:-}" resolved base ver engine
+  printf ''
+  [[ -n "$path" ]] || return 0
+  resolved="$(cocoon_browser_resolve "$path" 2>/dev/null || true)"
+  [[ -n "$resolved" ]] || return 0
+  path="$resolved"
+  base="${path##*/}"
+  engine="$(cocoon_browser_engine "$base" 2>/dev/null || true)"
+  if [[ -n "$engine" ]]; then
+    printf '%s' "$engine"
+    return 0
+  fi
+  ver="$(cocoon_browser_version "$path" 2>/dev/null || true)"
+  case "$ver" in
+    *Firefox* | *LibreWolf* | *Zen* | *Waterfox* | *Floorp*)
+      printf 'firefox'
+      return 0
+      ;;
+    *Chrome* | *Chromium* | *Brave* | *Vivaldi* | *Edge* | *Opera* | *Thorium* | *Ungoogled*)
+      printf 'chromium'
+      return 0
+      ;;
+  esac
+  return 0
+}
+
+# cocoon_browsers_native_rows — print TAB-separated rows for PATH browsers:
+# id \t engine \t bin \t display \t version. Respects $1 engine filter or empty.
+cocoon_browsers_native_rows() {
+  local filter="${1:-}" id eng ver
+  for id in ${_COCOON_CHROMIUM_CANDIDATES[@]+"${_COCOON_CHROMIUM_CANDIDATES[@]}"}; do
+    [[ -n "$filter" && "$filter" != "chromium" ]] && break
+    if command -v "$id" >/dev/null 2>&1; then
+      ver="$(cocoon_browser_version "$id")"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "chromium" "$id" "$(cocoon_browser_display_name "$id")" "$ver"
+    fi
+  done
+  for id in ${_COCOON_FIREFOX_CANDIDATES[@]+"${_COCOON_FIREFOX_CANDIDATES[@]}"}; do
+    [[ -n "$filter" && "$filter" != "firefox" ]] && continue
+    # NOTE: chromium loop uses break on filter mismatch (chromium block is
+    # first); firefox loop uses continue — both correct, do not "unify".
+    if command -v "$id" >/dev/null 2>&1; then
+      ver="$(cocoon_browser_version "$id")"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$id" "firefox" "$id" "$(cocoon_browser_display_name "$id")" "$ver"
+    fi
+  done
+}
+
+# Map a flatpak app id to "browser-id \t engine" or empty if unknown.
+_cocoon_flatpak_map() {
+  case "$1" in
+    com.google.Chrome) printf 'google-chrome-stable\tchromium' ;;
+    com.google.ChromeBeta) printf 'google-chrome-beta\tchromium' ;;
+    org.chromium.Chromium) printf 'chromium\tchromium' ;;
+    *ungoogled*chromium* | *UngoogledChromium*) printf 'ungoogled-chromium\tchromium' ;;
+    com.brave.Browser | com.brave.BrowserBeta) printf 'brave-browser\tchromium' ;;
+    com.vivaldi.Vivaldi) printf 'vivaldi-stable\tchromium' ;;
+    com.microsoft.Edge) printf 'microsoft-edge-stable\tchromium' ;;
+    com.opera.Opera) printf 'opera\tchromium' ;;
+    org.mozilla.firefox | org.mozilla.firefox_beta) printf 'firefox\tfirefox' ;;
+    io.gitlab.librewolf-community | io.gitlab.LibreWolf) printf 'librewolf\tfirefox' ;;
+    app.zen_browser.zen | io.github.zen_browser*) printf 'zen-browser\tfirefox' ;;
+    *floorp* | *Floorp*) printf 'floorp\tfirefox' ;;
+    *waterfox* | *Waterfox*) printf 'waterfox\tfirefox' ;;
+    *) return 1 ;;
+  esac
+}
+
+# cocoon_browsers_flatpak_rows [filter] — TAB rows for launchable flatpak
+# browsers: flatpak-id \t engine \t bin \t display \t version. A native
+# equivalent on PATH is NOT a reason to skip: the flatpak pin is a distinct,
+# genuine id and callers may prefer the sandboxed build.
+cocoon_browsers_flatpak_rows() {
+  local filter="${1:-}"
+  command -v flatpak >/dev/null 2>&1 || return 0
+  local app mapped bid beng
+  while IFS= read -r app; do
+    [[ -z "$app" ]] && continue
+    mapped="$(_cocoon_flatpak_map "$app" || true)"
+    [[ -z "$mapped" ]] && continue
+    bid="${mapped%%$'\t'*}"
+    beng="${mapped#*$'\t'}"
+    [[ -n "$filter" && "$filter" != "$beng" ]] && continue
+    printf 'flatpak:%s\t%s\t%s\t%s\t%s\n' "$app" "$beng" "flatpak run $app" \
+      "$(cocoon_browser_display_name "$bid")" "$(cocoon_browser_version "flatpak:$app")"
+  done < <(flatpak list --app --columns=application 2>/dev/null | tail -n +1 || true)
+}
+
+# cocoon_default_browser <chromium|firefox> -> first available binary id or empty
+cocoon_default_browser() {
+  local engine="${1:-}" id
+  if [[ "$engine" == "chromium" ]]; then
+    for id in ${_COCOON_CHROMIUM_CANDIDATES[@]+"${_COCOON_CHROMIUM_CANDIDATES[@]}"}; do
+      if command -v "$id" >/dev/null 2>&1; then printf '%s' "$id"; return 0; fi
+    done
+  elif [[ "$engine" == "firefox" ]]; then
+    for id in ${_COCOON_FIREFOX_CANDIDATES[@]+"${_COCOON_FIREFOX_CANDIDATES[@]}"}; do
+      if command -v "$id" >/dev/null 2>&1; then printf '%s' "$id"; return 0; fi
+    done
+  fi
+  printf ''
+}
+
+_cocoon_browsers_json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
+}
+
+_cocoon_browsers_usage() {
+  echo "Usage: cocoon-browsers [--json|--list] [--engine chromium|firefox] [--all]"
+  echo "       cocoon-browsers --default chromium|firefox"
+  echo "       cocoon-browsers --probe <path> [--json]"
+  echo "Lists installed browsers for isolated cocoon (see cocoon-help)."
+  echo "Flatpak browsers use launchable ids like flatpak:org.chromium.Chromium."
+}
+
+# ---- CLI main (skipped when sourced) ----
+_cocoon_browsers_main() {
+  local mode="table" filter="" include_flatpak_list=false default_engine=""
+  local probe_path="" json_requested=false
+  while (($# > 0)); do
+    case "$1" in
+      --json) json_requested=true; [[ "$mode" == "probe" ]] || mode="json"; shift ;;
+      --list) mode="list"; shift ;;
+      --probe)
+        probe_path="${2:?--probe needs a path}"; shift 2
+        mode="probe"
+        ;;
+      --engine)
+        filter="${2:?--engine needs chromium|firefox}"; shift 2
+        if [[ "$filter" != "chromium" && "$filter" != "firefox" ]]; then
+          echo "cocoon-browsers: --engine must be chromium|firefox, got '$filter'" >&2
+          exit 1
+        fi
+        ;;
+      --all) include_flatpak_list=true; shift ;;
+      --default)
+        default_engine="${2:?--default needs chromium|firefox}"; shift 2
+        mode="default"
+        ;;
+      -h | --help) _cocoon_browsers_usage; exit 0 ;;
+      --version) printf '%s %s\n' "$(basename "$0")" "$(_cocoon_browsers_cmd_version)"; exit 0 ;;
+      --) shift; break ;;
+      -*) echo "cocoon-browsers: unknown flag: $1" >&2; _cocoon_browsers_usage >&2; exit 1 ;;
+      *) echo "cocoon-browsers: unexpected arg: $1" >&2; _cocoon_browsers_usage >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ "$mode" == "probe" ]]; then
+    local peng pver
+    peng="$(cocoon_browser_probe_engine "$probe_path" 2>/dev/null || true)"
+    pver="$(cocoon_browser_version "$probe_path" 2>/dev/null || true)"
+    if [[ "$json_requested" == "true" ]]; then
+      printf '{"path":"%s","engine":"%s","version":"%s"}\n' \
+        "$(_cocoon_browsers_json_escape "$probe_path")" \
+        "$(_cocoon_browsers_json_escape "$peng")" \
+        "$(_cocoon_browsers_json_escape "$pver")"
+    elif [[ -n "$peng" ]]; then
+      printf '%s\n' "$peng"
+    fi
+    exit 0
+  fi
+
+  if [[ "$mode" == "default" ]]; then
+    cocoon_default_browser "$default_engine"
+    # Trailing newline only when non-empty (clean command substitution).
+    if [[ -n "$(cocoon_default_browser "$default_engine")" ]]; then printf '\n'; fi
+    exit 0
+  fi
+
+  if [[ "$mode" == "json" ]]; then
+    local first=true id eng bin name ver
+    printf '['
+    while IFS=$'\t' read -r id eng bin name ver; do
+      [[ -z "$id" ]] && continue
+      $first || printf ','
+      first=false
+      printf '{"id":"%s","engine":"%s","bin":"%s","name":"%s","version":"%s","source":"%s","supported":%s}' \
+        "$(_cocoon_browsers_json_escape "$id")" "$eng" \
+        "$(_cocoon_browsers_json_escape "$bin")" "$(_cocoon_browsers_json_escape "$name")" \
+        "$(_cocoon_browsers_json_escape "$ver")" "path" "true"
+    done < <(cocoon_browsers_native_rows "$filter")
+    local feng fname
+    while IFS=$'\t' read -r id feng bin fname ver; do
+      [[ -z "$id" ]] && continue
+      $first || printf ','
+      first=false
+      printf '{"id":"%s","engine":"%s","bin":"%s","name":"%s","version":"%s","source":"%s","supported":%s}' \
+        "$(_cocoon_browsers_json_escape "$id")" "$feng" \
+        "$(_cocoon_browsers_json_escape "$bin")" "$(_cocoon_browsers_json_escape "$fname (flatpak)")" \
+        "$(_cocoon_browsers_json_escape "$ver")" "flatpak" "true"
+    done < <(cocoon_browsers_flatpak_rows "$filter")
+    printf ']\n'
+    exit 0
+  fi
+
+  if [[ "$mode" == "list" ]]; then
+    cocoon_browsers_native_rows "$filter" | cut -f1
+    if [[ "$include_flatpak_list" == "true" ]]; then
+      cocoon_browsers_flatpak_rows "$filter" | cut -f1
+    fi
+    exit 0
+  fi
+
+  # Human table.
+  local rows flat
+  rows="$(cocoon_browsers_native_rows "$filter")"
+  if [[ -z "$rows" ]]; then
+    echo "(no native browsers found)"
+  else
+    printf '%-24s %-9s %s\n' "BROWSER" "ENGINE" "VERSION"
+    while IFS=$'\t' read -r id eng _bin name ver; do
+      [[ -z "$id" ]] && continue
+      printf '%-24s %-9s %s\n' "$id ($name)" "$eng" "$ver"
+    done <<<"$rows"
+  fi
+  flat="$(cocoon_browsers_flatpak_rows "$filter")"
+  if [[ -n "$flat" ]]; then
+    echo ""
+    echo "Flatpak (launchable — pin with --browser flatpak:<app-id>):"
+    while IFS=$'\t' read -r id feng bin fname ver; do
+      [[ -z "$id" ]] && continue
+      printf '  %-34s %-9s %s\n' "$id ($fname)" "$feng" "$ver"
+    done <<<"$flat"
+  fi
+}
+
+# Run main only when executed, not when sourced.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  _cocoon_browsers_main "$@"
+fi

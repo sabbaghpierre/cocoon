@@ -31,6 +31,11 @@ class _RemoveScreenState extends State<RemoveScreen> {
     _load();
   }
 
+  @override
+  void dispose() {
+    super.dispose();
+  }
+
   Future<void> _load() async {
     setState(() {
       apps = null;
@@ -53,14 +58,17 @@ class _RemoveScreenState extends State<RemoveScreen> {
   Future<void> _execute(bool withPurge) async {
     final items = apps ?? const <WebApp>[];
     final names =
-        checked.map((i) => items[i].name).toList(growable: false)..sort();
+        checked
+            .where((i) => i >= 0 && i < items.length)
+            .map((i) => items[i].name)
+            .toList(growable: false)
+          ..sort();
     setState(() {
       confirming = false;
       result = 'Removing…';
     });
     try {
-      final r =
-          await component.backend.removeApps(names, purge: withPurge);
+      final r = await component.backend.removeApps(names, purge: withPurge);
       if (!mounted) return;
       setState(() {
         result = r.output.trim().isEmpty ? '(done)' : r.output.trim();
@@ -143,13 +151,19 @@ class _RemoveScreenState extends State<RemoveScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Text('Remove webapps (space: toggle · Esc: back)',
-                style: TextStyle(
-                    fontWeight: FontWeight.bold, color: Colors.yellow)),
+            const Text(
+              'Remove webapps (space: toggle · Esc: back)',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: Colors.yellow,
+              ),
+            ),
             const SizedBox(height: 1),
             if (err != null)
-              Text('Error: $err',
-                  style: const TextStyle(color: Colors.brightRed))
+              Text(
+                'Error: $err',
+                style: const TextStyle(color: Colors.brightRed),
+              )
             else if (items == null)
               const Text('Loading…')
             else if (items.isEmpty)
@@ -164,10 +178,7 @@ class _RemoveScreenState extends State<RemoveScreen> {
                   ],
                 ),
               ),
-            if (result != null) ...[
-              const SizedBox(height: 1),
-              Text(result!),
-            ],
+            if (result != null) ...[const SizedBox(height: 1), Text(result!)],
             const SizedBox(height: 1),
             Text(
               'purge isolated data: ${purge ? 'ON' : 'off'} (p toggles) · '
@@ -175,9 +186,9 @@ class _RemoveScreenState extends State<RemoveScreen> {
               style: const TextStyle(color: Colors.brightBlack),
             ),
             if (confirming)
-              const Text(
-                'Delete? y: keep data · P: PURGE data · n: cancel',
-                style: TextStyle(color: Colors.brightRed),
+              Text(
+                'Delete? y: ${purge ? 'PURGE' : 'keep'} data · P: always PURGE · n: cancel',
+                style: const TextStyle(color: Colors.brightRed),
               ),
           ],
         ),
@@ -194,8 +205,7 @@ class _RemoveScreenState extends State<RemoveScreen> {
           : null,
       child: Text(
         '${isSelected ? '>' : ' '} $box ${app.name} [${app.engine}]',
-        style: TextStyle(
-            color: isSelected ? Colors.brightWhite : Colors.white),
+        style: TextStyle(color: isSelected ? Colors.brightWhite : Colors.white),
       ),
     );
   }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# webapp-list — list installed isolated webapps.
-# Usage: webapp-list [-h|--help] [--json]
+# cocoon-list — list installed isolated cocoon.
+# Usage: cocoon-list [-h|--help] [--json]
 #   --json emits [{"name","engine","browser","url","desktop"}] for machine consumers.
 set -euo pipefail
 
@@ -24,7 +24,7 @@ if [[ "${1:-}" == "--version" ]]; then
 fi
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  echo "Usage: webapp-list [--json]   (lists installed webapps; see webapp-help for the full toolkit)"
+  echo "Usage: cocoon-list [--json]   (lists installed cocoon; see cocoon-help for the full toolkit)"
   exit 0
 fi
 
@@ -38,18 +38,34 @@ json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
 }
 
+# Reverse cocoon-create's exec_escape so ids/paths read back as authored.
+unescape_field() {
+  printf '%s' "$1" | sed -e 's/\\\\/\\/g' -e 's/\\"/"/g' -e 's/\\\$/$/g' -e 's/\\`/`/g' -e 's/%%/%/g'
+}
+
+# parse_exec_field <exec-line> <name> -> quoted value with spaces kept intact.
+parse_exec_field() {
+  local line="$1" key="$2" val=""
+  if [[ "$line" =~ --$key[[:space:]]+\"(([^\"\\]|\\.)*)\" ]]; then
+    val="${BASH_REMATCH[1]}"
+  elif [[ "$line" =~ --$key[[:space:]]+([^[:space:]\"]+) ]]; then
+    val="${BASH_REMATCH[1]}"
+  fi
+  unescape_field "$val"
+}
+
 first=true
 found=0
 if [[ "$JSON" == "true" ]]; then printf '['; else printf '%-24s %-8s %-18s %s\n' "NAME" "ENGINE" "BROWSER" "URL"; fi
 while IFS= read -r -d '' file; do
   exec_line="$(grep -m1 '^Exec=' "$file" || true)"
-  [[ "$exec_line" == *"webapp-launch-"* ]] || continue
+  [[ "$exec_line" == *"cocoon-launch-"* || "$exec_line" == *"cocoon launch chrome"* || "$exec_line" == *"cocoon launch firefox"* ]] || continue
   name="$(basename "${file%.desktop}")"
   engine="custom"
-  [[ "$exec_line" == *"webapp-launch-chrome"* ]] && engine="chrome"
-  [[ "$exec_line" == *"webapp-launch-firefox"* ]] && engine="firefox"
-  browser="$(printf '%s' "$exec_line" | sed -n 's/.*--browser[ "]*\([^ "]*\).*/\1/p' | head -n1 || true)"
-  url="$(printf '%s' "$exec_line" | sed -n 's/.*--url[ "]*\([^ "]*\).*/\1/p')"
+  [[ "$exec_line" == *"cocoon-launch-chrome"* || "$exec_line" == *" launch chrome "* ]] && engine="chrome"
+  [[ "$exec_line" == *"cocoon-launch-firefox"* || "$exec_line" == *" launch firefox "* ]] && engine="firefox"
+  browser="$(parse_exec_field "$exec_line" browser)"
+  url="$(parse_exec_field "$exec_line" url)"
   if [[ -z "$url" ]]; then
     url="$(printf '%s' "$exec_line" | grep -oE 'https?://[^ "]*' | head -n1 || true)"
   fi
@@ -69,5 +85,5 @@ done < <(find "$DESKTOP_DIR" -maxdepth 1 -name '*.desktop' -print0 2>/dev/null)
 if [[ "$JSON" == "true" ]]; then printf ']\n'; fi
 
 if [[ "$found" == "0" && "$JSON" != "true" ]]; then
-  echo "(no webapps installed)"
+  echo "(no cocoon installed)"
 fi

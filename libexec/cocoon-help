@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# cocoon-help — overview of the cocoon-* toolkit (Omarchy-style cocoon for Void/KDE).
+# Usage: cocoon-help
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+cat <<'EOF'
+Cocoon — isolated web apps for any distro/desktop (chrome --app / firefox profiles)
+
+USAGE: cocoon <command> [args...]
+
+COMMANDS
+  create [name] [url] [engine]     Create an isolated web app (interactive if
+                                    args are missing). --name --url --engine
+                                    --browser <id> --browser-bin <path> --icon
+                                    --mime --force --no-icon
+
+  list [--json]                    List installed web apps.
+  open <name>                      Launch an installed web app by name.
+  remove [--purge] [names...]      Remove .desktop + icon + KWin rule; --purge
+                                   also wipes isolated browser data. No args =
+                                   interactive multi-select.
+  edit <name> [--url URL] [--browser ID] [--icon REF] [--mime TYPES]
+                                   Change an app in place; its profile/logins survive.
+  icon <name> [--url URL]          Refresh an app's favicon.
+  doctor [name...]                 Health check: launcher, icon, WM class,
+                                   desktop validation, profile, CSS, KWin rule,
+                                   live process, orphans. --json, --deps.
+  doctor --fix [name...]           Repair fixable issues (KWin rule, CSS, icon pref).
+  doctor --probe [name]            Live window identity (alias: cocoon probe).
+  browsers [--probe <path>]        List detectable browsers for --browser;
+                                    --probe reports the engine of a custom binary.
+  config [--key value]             Show/set defaults (engine, browser, categories).
+  update [--check]                 Upgrade the toolkit in place (data untouched).
+  uninstall [--purge]              Remove the TOOLKIT (not an app — that's
+                                   `cocoon remove`). --purge wipes every app too.
+  help                             Show this overview.
+
+WORKFLOWS
+  New app:      cocoon create "Strafe" https://strafe.com firefox
+  Flatpak app:  cocoon create "YT" https://youtube.com --browser flatpak:org.chromium.Chromium
+  Verify:       cocoon doctor Strafe
+  Remove:       cocoon remove --purge Strafe
+  Icon wrong:   launch from your app menu, focus the window, cocoon probe Strafe
+  Popup stuck:  hover the top edge, move onto the popup, Allow (one-time;
+                the grant ends any retry loop for good).
+
+WHERE THINGS LIVE
+  Command + modules ......... ~/.local/share/cocoon/bin/cocoon, libexec/
+  Desktop files ............. ~/.local/share/applications/<Name>.desktop
+  Icons (hicolor theme) ..... ~/.local/share/icons/hicolor/128x128/apps/<slug>.png
+  Browser data + run logs .. ~/.local/share/cocoon/ (chrome-<slug>/, firefox-<slug>/, <slug>.log)
+                                 Legacy profiles in ~/.local/share/webapps are read
+                                 transparently; new data/logs always go to cocoon/.
+                                 --purge wipes profiles+logs from BOTH roots.
+   Window rules .............. ~/.config/kwinrulesrc ("cocoon: <Name>")
+
+NOTES
+   - Legacy profiles left in ~/.local/share/webapps are used transparently
+     (no fresh empty profile); the legacy root is read-only and --purge cleans it too.
+   - Every app is isolated: its own Chrome data dir or Firefox profile (log in once).
+   - Apps are pinned to the browser picked at creation (see the .desktop Exec:
+     --browser "..."). Older apps use the first-found binary of their engine.
+   - Custom binaries/wrappers: --browser-bin <path> pins any executable (paths
+     with spaces are OK). Custom paths require --engine unless the engine can
+     be detected from the binary; a confident mismatch is rejected. A
+     --browser-bin value without '/' is treated as --browser (legacy alias).
+
+  - Chrome-engine apps route ordinary clicked links to your system default
+    browser (link-router extension + native host via xdg-open). Same-origin
+    and OAuth-style popups stay in-app so logins can complete. Downloads,
+    mailto:/tel: and same-document anchors are untouched. Branded Chrome 137+
+    ignores --load-extension, so link-out is unavailable there.
+  - Firefox-engine apps keep clicks in-app: Mozilla requires AMO signing for
+    release-Firefox extensions (no per-profile override), so the router
+    cannot install there. Prefer a chromium browser when link-out matters.
+  - Firefox apps use native Wayland when available, a dedicated app_id, and
+    (on Plasma) a KWin rule so the taskbar shows the site icon, not the browser logo.
+
+FLATPAK BROWSERS
+   `cocoon browsers` also lists installed Flatpak browsers as launchable ids
+   like flatpak:org.chromium.Chromium. Pin one at creation time:
+     cocoon create "YT" https://youtube.com --browser flatpak:org.chromium.Chromium
+   Each launch uses `flatpak run --filesystem=<cocoon data dir> <app-id>` (a
+   per-run bind — no permanent `flatpak override`, and never host-wide access).
+   Sandbox limits: link-out is disabled for Flatpak apps (the native-messaging
+   host is outside the sandbox), so clicks stay inside the app window. Window
+   identity can differ under Flatpak — if the taskbar icon does not match, run
+   `cocoon probe <name>` to inspect the live app_id/WM class.
+
+PORTABILITY (distro- and DE-agnostic by design)
+  Hard requirements: bash, curl, setsid + one browser (any Chromium-family
+  build for the chrome engine, or firefox/librewolf/zen/... for the firefox
+  engine). Run `cocoon browsers` to list yours, `cocoon doctor --deps`
+  for a full check with install commands for your distro.
+  - Any distro: no package-manager calls in the code; only install tips adapt.
+  - bash, zsh and fish: the installer wires PATH for all three.
+  - Any Wayland/X11 desktop: .desktop files use absolute Exec paths.
+  - `cocoon doctor --probe` auto-detects KWin, niri, Hyprland, Sway
+    (GNOME: prints Looking Glass steps).
+EOF
+
+printf '\nCocoon %s\n' "$(cmd_version)"
+
+if ! command -v gum >/dev/null 2>&1; then
+  echo ""
+  HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cocoon-env.sh"
+  if [[ -f "$HELPER" ]]; then
+    # shellcheck disable=SC1090
+    source "$HELPER" 2>/dev/null || true
+  fi
+  if declare -F cocoon_install_cmd >/dev/null 2>&1; then
+    GUM_TIP="$(cocoon_install_cmd gum)"
+    if [[ -n "$GUM_TIP" ]]; then
+      echo "Tip: $GUM_TIP  (for the Omarchy-style interactive prompts)"
+    fi
+  else
+    echo "Tip: sudo xbps-install -S gum  (for the Omarchy-style interactive prompts)"
+  fi
+fi

@@ -1,6 +1,6 @@
+import 'package:cocoon_tui/app.dart';
 import 'package:nocterm/nocterm.dart';
-import 'package:webapp_tui/app.dart';
 
 Future<void> main() async {
-  await runApp(WebAppTui());
+  await runApp(CocoonTui());
 }

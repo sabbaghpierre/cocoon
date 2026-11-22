@@ -1,25 +1,29 @@
-// webapp-kit link router — MAIN-world shim (document_start, top frame only).
+// Cocoon link router — MAIN-world shim (document_start, top frame only).
 // Runs in the page's own JS world so it can patch the REAL window.open:
 // content scripts run in an isolated world, where overriding window.open has
 // no effect on the page. Requires Chromium >= 111 ("world":"MAIN").
-//
-// It only forwards http(s) popups to the isolated content script via
-// postMessage; that script owns the native-host bridge. If nothing bridges
-// (host missing), the content script falls back to a real popup.
 'use strict';
 
 (() => {
-  if (window.__webappkitRouterInjected) return;
-  window.__webappkitRouterInjected = true;
+  if (window.__cocoonRouterInjected) return;
+  window.__cocoonRouterInjected = true;
 
   const rawOpen = window.open;
   const MARKER = 1;
+  // Shared with the isolated content script through the DOM (JS globals are
+  // NOT shared between worlds). Prevents page scripts forging router messages.
+  const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  try {
+    document.documentElement.setAttribute('data-cocoon-router', nonce);
+  } catch (e) {
+    /* documentElement may not exist yet at document_start */
+  }
 
   function isHttpUrl(url) {
     return url.protocol === 'http:' || url.protocol === 'https:';
   }
 
-  window.open = function (url, ...rest) {
+  window.open = function (url, target, features) {
     if (typeof url === 'string') {
       let parsed = null;
       try {
@@ -28,17 +32,28 @@
         parsed = null;
       }
       if (parsed && isHttpUrl(parsed)) {
-        try {
-          window.postMessage(
-            { __webappkitRouter: MARKER, kind: 'open', url: parsed.href },
-            '*'
-          );
-        } catch (e) {
-          /* postMessage should never throw here, but never break the page */
+        // Same-origin popups and explicit-size (OAuth/SSO style) popups must
+        // stay in the app: their postMessage/cookie callback completes here.
+        const sameOrigin = parsed.origin === window.location.origin;
+        const oauthLike = typeof features === 'string' && features.length > 0;
+        if (!sameOrigin && !oauthLike) {
+          try {
+            window.postMessage(
+              {
+                __cocoonRouter: MARKER,
+                nonce,
+                kind: 'open',
+                url: parsed.href,
+              },
+              window.location.origin
+            );
+          } catch (e) {
+            /* never break the page */
+          }
+          return null;
         }
-        return null;
       }
     }
-    return rawOpen.call(window, url, ...rest);
+    return rawOpen.call(window, url, target, features);
   };
 })();

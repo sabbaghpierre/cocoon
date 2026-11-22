@@ -1,4 +1,4 @@
-/// Static help overlay mirroring `webapp-help`.
+/// Static help overlay for the Cocoon TUI.
 library;
 
 import 'package:nocterm/nocterm.dart';
@@ -11,22 +11,27 @@ class HelpScreen extends StatelessComponent {
   @override
   Component build(BuildContext context) {
     const lines = [
-      'webapp-kit help',
+      'Cocoon help',
       '',
       'Dashboard keys:',
       '  up/down or j/k .. move selection',
-      '  c ................ create a webapp',
-      '  x ................ remove webapp(s)',
-      '  d / Enter ........ doctor (health check)',
-      '  p ................ probe live window identity',
-      '  r ................ refresh list',
-      '  q ................ quit',
+      '  Enter ................ launch highlighted webapp',
+      '  c .................... create a webapp',
+      '  x .................... remove webapp(s)',
+      '  d .................... doctor (health check)',
+      '  p .................... probe live window identity',
+      '  r .................... refresh list',
+      '  q .................... quit',
       '',
       'Each webapp is isolated: own Chrome data dir or Firefox',
       'profile (log in once inside the webapp window).',
       '',
-      'CLI equivalents: webapp-create, webapp-remove --purge,',
-      'webapp-list, webapp-doctor [--probe NAME] [--deps].',
+      'Create: pick a detected browser, or a custom binary path',
+      '(paths with spaces OK). Custom paths send an explicit engine;',
+      'the CLI needs --engine unless it detects the browser itself.',
+      '',
+      'CLI equivalents: cocoon list, cocoon create, cocoon remove,',
+      'cocoon open, cocoon doctor [--probe NAME], cocoon browsers.',
       '',
       'Press Esc to go back.',
     ];
@@ -43,9 +48,7 @@ class HelpScreen extends StatelessComponent {
         padding: const EdgeInsets.all(1),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            for (final line in lines) Text(line),
-          ],
+          children: [for (final line in lines) Text(line)],
         ),
       ),
     );

@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "webapp-kit link router",
+  "name": "Cocoon link router",
   "version": "0.0.2",
-  "description": "Opens every clicked link in the system default browser via the webapp-kit native host. Loaded unpacked by webapp-launch-chrome into isolated webapp windows.",
-  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjtseYJoTpOeS1Z7f1Lq3h7+XY3qFfnH9ZJ9/uW8OlqiI+2HNT891+fSfG9dCWp9bFb5Skkuihy5XdaXEyMpP6MK6u0Wb5W7IsYLkkGo1b5XyIYMZ4FO1fypk87Io2HidQgELt1zpqcJETZF26xRaXpG4mNTEdcQNKtnhWEE5yZv68cJ8FtqaTtan75TEPn0vB6X66iJuSLa4hJrU83VPJYgbjPUKwc9UhgMdOhYZSOiBp+qoBAH7n/w2Nt43hN0SYyNb11xHMgq8NlvqmSBMEsxBGVLtDTqKUSR9bKwf+jExITH06qgAonmtNdFj/lu1NHJ9z+e/rrgqXp6BVjyWFwIDAQAB",
+  "description": "Opens every clicked link in the system default browser via the Cocoon native host. Loaded unpacked by cocoon-launch-chrome into isolated cocoon windows.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtVelos5XCa7j18BU8VipMF5eW952Ym943751m6HC8a8MO5gqIQCn7pB14u71Wx52rlMJXXMD5JCiEwVllzLEYWwbxuta0rklY01/+hIdMH5AjxztdUSgJWIc7gG1jPrxqxnlrFfQET/pVEH3LHdztxWcXiP9yT7NmWvfzitqlffbmy9q1Ho646oMytXjLpwj8Cf4Yha2uWHbd/hV1n+N6a+bSHA2pbNBskltx8FqMoj0sBeFG7QIELA4AhC1HbFaF1/fJWTWxFC4N3Cc7XBX0Cn5Frn9hV3FRRMkC74IupwLIZywvNwbGEpm+QxdeA9IdQ6KNsKUlJuW4Sf8tJWdfQIDAQAB",
   "permissions": ["nativeMessaging"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": {

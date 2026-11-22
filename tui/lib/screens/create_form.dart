@@ -8,7 +8,7 @@ import 'package:nocterm/nocterm.dart';
 import '../backend.dart';
 import '../models.dart';
 
-enum _Step { name, url, engine, icon, confirm, working, done }
+enum _Step { name, url, engine, customBin, icon, confirm, working, done }
 
 class CreateScreen extends StatefulComponent {
   final Backend backend;
@@ -25,8 +25,9 @@ class _CreateScreenState extends State<CreateScreen> {
   final nameCtrl = TextEditingController();
   final urlCtrl = TextEditingController();
   final iconCtrl = TextEditingController();
-  // Browser picker (from `webapp-browsers --json`). Falls back to the
-  // legacy chrome/firefox toggle when detection fails or finds nothing.
+  final customBinCtrl = TextEditingController();
+  // Browser picker (from `cocoon browsers --json`). Falls back to the
+  // legacy chrome/firefox toggle when detection is unavailable or empty.
   List<Browser> browsers = const [];
   int browserIndex = 0;
   bool browsersLoading = true;
@@ -41,6 +42,15 @@ class _CreateScreenState extends State<CreateScreen> {
     _loadBrowsers();
   }
 
+  @override
+  void dispose() {
+    nameCtrl.dispose();
+    urlCtrl.dispose();
+    iconCtrl.dispose();
+    customBinCtrl.dispose();
+    super.dispose();
+  }
+
   Future<void> _loadBrowsers() async {
     try {
       final all = await component.backend.listBrowsers();
@@ -51,9 +61,10 @@ class _CreateScreenState extends State<CreateScreen> {
         browserIndex = 0;
         browsersLoading = false;
       });
-    } catch (_) {
-      // Old toolkit without webapp-browsers, detection failure, or test
-      // fakes that don't stub it: fall back to the legacy engine toggle.
+    } on BackendException {
+      // Detection unavailable (e.g. old CLI): fall back to the legacy
+      // engine toggle. Genuine defects must surface, so nothing else is
+      // swallowed here.
       if (!mounted) return;
       setState(() => browsersLoading = false);
     }
@@ -61,17 +72,59 @@ class _CreateScreenState extends State<CreateScreen> {
 
   bool get _useBrowserList => browsers.isNotEmpty;
 
-  String get _engine =>
-      _useBrowserList ? (_pickedEngine) : (engineIsChrome ? 'chrome' : 'firefox');
+  int get _safeBrowserIndex =>
+      browsers.isEmpty ? 0 : browserIndex.clamp(0, browsers.length - 1).toInt();
 
-  String get _pickedEngine {
-    final b = browsers[browserIndex];
-    return b.engine == 'chromium' ? 'chrome' : 'firefox';
+  // Browser/engine choices: detected browsers (or the legacy 2-way toggle),
+  // plus two explicit custom-binary choices (chrome / firefox engine).
+  int get _baseOptionCount => _useBrowserList ? browsers.length : 2;
+  int get _optionCount => _baseOptionCount + 2;
+  int get _safeOptionIndex => browserIndex.clamp(0, _optionCount - 1).toInt();
+  bool get _customChosen => _safeOptionIndex >= _baseOptionCount;
+  bool get _customIsChrome => _safeOptionIndex == _baseOptionCount;
+
+  String get _engine {
+    if (_customChosen) return _customIsChrome ? 'chrome' : 'firefox';
+    return _useBrowserList
+        ? _pickedEngine
+        : (engineIsChrome ? 'chrome' : 'firefox');
   }
 
-  String? get _pickedBrowser => _useBrowserList ? browsers[browserIndex].id : null;
+  String get _pickedEngine {
+    if (!_useBrowserList) return engineIsChrome ? 'chrome' : 'firefox';
+    final engine = browsers[_safeBrowserIndex].engine;
+    switch (engine) {
+      case 'chromium':
+      case 'chrome':
+        return 'chrome';
+      case 'firefox':
+      case 'ff':
+        return 'firefox';
+      default:
+        // Never silently map an unknown engine to firefox.
+        return engine;
+    }
+  }
 
-  static const _order = [_Step.name, _Step.url, _Step.engine, _Step.icon];
+  String? get _pickedBrowser =>
+      _useBrowserList && !_customChosen ? browsers[_safeBrowserIndex].id : null;
+
+  String? get _pickedBrowserBin {
+    if (!_customChosen) return null;
+    final path = customBinCtrl.text.trim();
+    return path.isEmpty ? null : path;
+  }
+
+  static const _baseOrder = [_Step.name, _Step.url, _Step.engine];
+  List<_Step> get _order => _customChosen
+      ? const [..._baseOrder, _Step.customBin, _Step.icon]
+      : const [..._baseOrder, _Step.icon];
+  List<_Step> get _flow => [
+    ..._order,
+    _Step.confirm,
+    _Step.working,
+    _Step.done,
+  ];
 
   void _next() {
     if (step == _Step.name && nameCtrl.text.trim().isEmpty) {
@@ -82,9 +135,15 @@ class _CreateScreenState extends State<CreateScreen> {
       setState(() => error = 'URL is required.');
       return;
     }
+    if (step == _Step.customBin && customBinCtrl.text.trim().isEmpty) {
+      setState(() => error = 'Binary path is required.');
+      return;
+    }
+    final i = _flow.indexOf(step);
+    if (i < 0 || i + 1 >= _flow.length) return;
     setState(() {
       error = null;
-      step = _Step.values[_Step.values.indexOf(step) + 1];
+      step = _flow[i + 1];
     });
   }
 
@@ -121,6 +180,7 @@ class _CreateScreenState extends State<CreateScreen> {
         engine: _engine,
         browser: _pickedBrowser,
         icon: iconCtrl.text.trim().isEmpty ? null : iconCtrl.text.trim(),
+        browserBin: _pickedBrowserBin,
       );
       if (!mounted) return;
       setState(() {
@@ -153,21 +213,17 @@ class _CreateScreenState extends State<CreateScreen> {
     if (step == _Step.engine) {
       if (event.logicalKey == LogicalKey.arrowUp) {
         setState(() {
-          if (_useBrowserList) {
-            browserIndex = (browserIndex - 1 + browsers.length) % browsers.length;
-          } else {
-            engineIsChrome = !engineIsChrome;
-          }
+          final i = (_safeOptionIndex - 1 + _optionCount) % _optionCount;
+          browserIndex = i;
+          if (!_useBrowserList && i < 2) engineIsChrome = i == 0;
         });
         return true;
       }
       if (event.logicalKey == LogicalKey.arrowDown) {
         setState(() {
-          if (_useBrowserList) {
-            browserIndex = (browserIndex + 1) % browsers.length;
-          } else {
-            engineIsChrome = !engineIsChrome;
-          }
+          final i = (_safeOptionIndex + 1) % _optionCount;
+          browserIndex = i;
+          if (!_useBrowserList && i < 2) engineIsChrome = i == 0;
         });
         return true;
       }
@@ -175,7 +231,7 @@ class _CreateScreenState extends State<CreateScreen> {
         _next();
         return true;
       }
-      if (event.character == 'e' && !_useBrowserList) {
+      if (event.character == 'e' && !_useBrowserList && !_customChosen) {
         setState(() => engineIsChrome = !engineIsChrome);
         return true;
       }
@@ -188,7 +244,10 @@ class _CreateScreenState extends State<CreateScreen> {
         return true;
       }
       if (ch == 'n') {
-        _back();
+        setState(() {
+          error = null;
+          step = _Step.icon;
+        });
         return true;
       }
       return false;
@@ -205,33 +264,32 @@ class _CreateScreenState extends State<CreateScreen> {
     final body = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Text('Create webapp (Enter: next · Esc: back)',
-            style:
-                TextStyle(fontWeight: FontWeight.bold, color: Colors.yellow)),
+        const Text(
+          'Create webapp (Enter: next · Esc: back)',
+          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.yellow),
+        ),
         const SizedBox(height: 1),
         _stepBody(),
         if (error != null) ...[
           const SizedBox(height: 1),
-          Text('Error: $error',
-              style: const TextStyle(color: Colors.brightRed)),
+          Text(
+            'Error: $error',
+            style: const TextStyle(color: Colors.brightRed),
+          ),
         ],
       ],
     );
     // Selection steps own a Focusable (no fields mounted); input steps
     // render bare so the focused TextField receives keys exclusively.
-    if (step == _Step.engine ||
-        step == _Step.confirm ||
-        step == _Step.done) {
+    if (step == _Step.engine || step == _Step.confirm || step == _Step.done) {
       return Focusable(
         focused: true,
         onKeyEvent: (event) => _selectKeys(event),
-        child: Container(
-            padding: const EdgeInsets.all(1), child: body),
+        child: Container(padding: const EdgeInsets.all(1), child: body),
       );
     }
     if (step == _Step.working) {
-      return Container(
-          padding: const EdgeInsets.all(1), child: body);
+      return Container(padding: const EdgeInsets.all(1), child: body);
     }
     return Container(padding: const EdgeInsets.all(1), child: body);
   }
@@ -260,27 +318,46 @@ class _CreateScreenState extends State<CreateScreen> {
         if (browsersLoading) {
           return const Text('Detecting installed browsers…');
         }
-        if (_useBrowserList) {
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              for (var i = 0; i < browsers.length; i++)
-                _engineRow(browsers[i].label, i == browserIndex),
-              const SizedBox(height: 1),
-              const Text('up/down: select · Enter: confirm',
-                  style: TextStyle(color: Colors.brightBlack)),
-            ],
-          );
-        }
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _engineRow('chrome  (--app SSB window)', engineIsChrome),
-            _engineRow('firefox (minimal-UI profile)', !engineIsChrome),
+            if (_useBrowserList)
+              for (var i = 0; i < browsers.length; i++)
+                _engineRow(browsers[i].label, i == _safeOptionIndex)
+            else ...[
+              _engineRow(
+                'chrome  (--app SSB window)',
+                !_customChosen && _safeOptionIndex == 0,
+              ),
+              _engineRow(
+                'firefox (minimal-UI profile)',
+                !_customChosen && _safeOptionIndex == 1,
+              ),
+            ],
             const SizedBox(height: 1),
-            const Text('up/down or e: toggle · Enter: confirm',
-                style: TextStyle(color: Colors.brightBlack)),
+            _engineRow(
+              'custom binary path (chrome engine)',
+              _customChosen && _customIsChrome,
+            ),
+            _engineRow(
+              'custom binary path (firefox engine)',
+              _customChosen && !_customIsChrome,
+            ),
+            const SizedBox(height: 1),
+            const Text(
+              'up/down: select · Enter: confirm · custom paths send an explicit engine',
+              style: TextStyle(color: Colors.brightBlack),
+            ),
           ],
+        );
+      case _Step.customBin:
+        return TextField(
+          key: const ValueKey('create-browser-bin'),
+          controller: customBinCtrl,
+          focused: true,
+          placeholder: 'Binary path — /path/to/browser (spaces OK)',
+          onKeyEvent: (event) => _fieldKeys(event),
+          onSubmitted: (_) => _next(),
         );
       case _Step.icon:
         return TextField(
@@ -297,9 +374,10 @@ class _CreateScreenState extends State<CreateScreen> {
           children: [
             Text('Create "${nameCtrl.text.trim()}"?'),
             Text(
-                '  ${_pickedBrowser ?? _engine} · ${urlCtrl.text.trim()}${iconCtrl.text.trim().isEmpty ? '' : ' · custom icon'}'),
+              '  ${_pickedBrowser ?? _pickedBrowserBin ?? _engine} · ${urlCtrl.text.trim()}${iconCtrl.text.trim().isEmpty ? '' : ' · custom icon'}',
+            ),
             const SizedBox(height: 1),
-            const Text('y/Enter: create · n/Esc: back'),
+            const Text('y/Enter: create · n: back to icon · Esc: exit'),
           ],
         );
       case _Step.working:
@@ -308,9 +386,12 @@ class _CreateScreenState extends State<CreateScreen> {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(result ?? '',
-                style: TextStyle(
-                    color: resultOk ? Colors.green : Colors.brightRed)),
+            Text(
+              result ?? '',
+              style: TextStyle(
+                color: resultOk ? Colors.green : Colors.brightRed,
+              ),
+            ),
             const SizedBox(height: 1),
             const Text('Press any key for dashboard.'),
           ],
@@ -324,9 +405,12 @@ class _CreateScreenState extends State<CreateScreen> {
       decoration: highlighted
           ? BoxDecoration(color: Color.fromRGB(30, 40, 50))
           : null,
-      child: Text('${highlighted ? '>' : ' '} $label',
-          style: TextStyle(
-              color: highlighted ? Colors.brightWhite : Colors.white)),
+      child: Text(
+        '${highlighted ? '>' : ' '} $label',
+        style: TextStyle(
+          color: highlighted ? Colors.brightWhite : Colors.white,
+        ),
+      ),
     );
   }
 }

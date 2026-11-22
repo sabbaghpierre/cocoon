@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# cocoon-config — show or set defaults used by `cocoon create`.
+set -euo pipefail
+unset IFS GLOBIGNORE
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cocoon"
+CONFIG_FILE="$CONFIG_DIR/config"
+mkdir -p "$CONFIG_DIR"
+
+usage() {
+  cat <<EOF
+Usage: cocoon config                 show current defaults
+       cocoon config <key>           show one default
+       cocoon config <key> <value>   set a default
+       cocoon config --unset <key>   remove a default
+
+Keys: engine (chrome|firefox), browser (id from 'cocoon browsers' — native or
+       flatpak:<app-id> — or a custom executable path; paths require an engine
+       unless detected), categories (semicolon-separated desktop categories).
+
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then usage; exit 0; fi
+
+show() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "(no defaults configured)"
+    return 0
+  fi
+  sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$CONFIG_FILE"
+}
+
+if (($# == 0)); then show; exit 0; fi
+if [[ "$1" == "--unset" ]]; then
+  [[ -n "${2:-}" ]] || { usage >&2; exit 1; }
+  if [[ -f "$CONFIG_FILE" ]]; then
+    tmp="$(mktemp "$CONFIG_DIR/.config.XXXXXX")"
+    grep -v "^$2=" "$CONFIG_FILE" >"$tmp" || true
+    mv -f "$tmp" "$CONFIG_FILE"
+  fi
+  echo "Removed default '$2'."
+  exit 0
+fi
+
+KEY="$1"
+VALUE="${2:-}"
+case "$KEY" in
+  engine)
+    [[ -n "$VALUE" && "$VALUE" != chrome && "$VALUE" != firefox ]] && {
+      echo "cocoon config: engine must be chrome or firefox" >&2; exit 1; }
+    ;;
+  browser | categories) ;;
+  *) echo "cocoon config: unknown key '$KEY'" >&2; usage >&2; exit 1 ;;
+esac
+
+if [[ -z "$VALUE" ]]; then
+  if [[ -f "$CONFIG_FILE" ]]; then
+    sed -n "s/^$KEY=//p" "$CONFIG_FILE" | head -n1
+  fi
+  exit 0
+fi
+
+tmp="$(mktemp "$CONFIG_DIR/.config.XXXXXX")"
+if [[ -f "$CONFIG_FILE" ]]; then
+  grep -v "^$KEY=" "$CONFIG_FILE" >"$tmp" || true
+fi
+printf '%s=%s\n' "$KEY" "$VALUE" >>"$tmp"
+mv -f "$tmp" "$CONFIG_FILE"
+echo "Set $KEY=$VALUE"

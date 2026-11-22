@@ -14,15 +14,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: version consistency (VERSION file vs pubspec literal)
-        run: |
-          test "$(cat VERSION)" = "$(sed -n 's/^version: //p' tui/pubspec.yaml)"
+      - name: version consistency (VERSION file, pubspec literal, git tag)
+        run: tool/version.sh --check "${GITHUB_REF_NAME}"
 
       - uses: dart-lang/setup-dart@v1
 
       - name: dependencies
         working-directory: tui
-        run: dart pub get
+        run: dart pub get --enforce-lockfile
+
+      - name: format
+        working-directory: tui
+        run: dart format --set-exit-if-changed .
 
       - name: analyze
         working-directory: tui
@@ -33,18 +36,27 @@ jobs:
         run: dart test
 
       - name: bash syntax
-        run: bash -n bin/webapp-* install.sh tool/*.sh
+        run: bash -n bin/cocoon libexec/* install.sh tool/*
 
-      - name: compile TUI (linux-x64, version baked in)
+      - name: compile cocoon-tui (linux-x64, version baked in)
         working-directory: tui
-        run: dart compile exe -DAPP_VERSION="${GITHUB_REF_NAME#v}" bin/webapp_tui.dart -o webapp-tui
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          entries=(bin/*tui.dart)
+          if [ "${#entries[@]}" -ne 1 ]; then
+            echo "expected exactly one TUI entry point, found ${#entries[@]}" >&2
+            exit 1
+          fi
+          dart compile exe -DAPP_VERSION="${GITHUB_REF_NAME#v}" "${entries[0]}" -o cocoon-tui
 
       - name: "publish release (retag-safe: refresh asset if release exists)"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload --clobber "${GITHUB_REF_NAME}" tui/webapp-tui
+            gh release upload --clobber "${GITHUB_REF_NAME}" tui/cocoon-tui
           else
-            gh release create "${GITHUB_REF_NAME}" --generate-notes tui/webapp-tui
+            gh release create "${GITHUB_REF_NAME}" --generate-notes tui/cocoon-tui
           fi

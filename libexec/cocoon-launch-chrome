@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# cocoon-launch-chrome — launch a URL as an isolated Chromium SSB window.
+# Omarchy equivalent of `omarchy-launch-cocoon`, but pinned to a Chromium
+# engine with a per-app --user-data-dir (isolated cookies/logins) instead of
+# following the xdg default browser (which breaks on Firefox-only systems).
+#
+# The concrete binary is pinned per-app via --browser (written by
+# cocoon-create from `cocoon-browsers` detection). Omitting --browser keeps
+# the legacy first-found behavior so pre-pinning .desktop files keep working.
+#
+# Usage:
+#   cocoon-launch-chrome --name "My App" --url "https://example.com" [--browser vivaldi-stable] [-- extra-chrome-flags...]
+#   cocoon-launch-chrome "https://example.com" [extra-chrome-flags...]
+#   A trailing URL-like positional (e.g. %u from a MimeType handler) overrides --url.
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+# Shared data-path resolution (source-only, stdout-silent). Sourced gracefully:
+# old installs lacking cocoon-paths.sh keep the hardcoded defaults below.
+COCOON_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1090
+source "$COCOON_MODULE_DIR/cocoon-paths.sh" 2>/dev/null || true
+DATA_ROOT="$HOME/.local/share/cocoon"
+LEGACY_DATA_ROOT="$HOME/.local/share/webapps"
+if declare -F cocoon_data_root >/dev/null 2>&1; then
+  _p="$(cocoon_data_root 2>/dev/null || true)"
+  [[ -n "$_p" ]] && DATA_ROOT="$_p"
+fi
+if declare -F cocoon_legacy_data_root >/dev/null 2>&1; then
+  _p="$(cocoon_legacy_data_root 2>/dev/null || true)"
+  [[ -n "$_p" ]] && LEGACY_DATA_ROOT="$_p"
+fi
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+NAME=""
+URL=""
+BROWSER=""
+EXTRA=()
+
+usage() {
+  echo "Usage: cocoon-launch-chrome --name \"My App\" --url \"https://example.com\" [--browser <id|path>] [-- extra-chrome-flags...]"
+  echo "       cocoon-browsers --list   # show valid --browser ids"
+}
+
+slugify() {
+  local s="$1"
+  s="${s// /-}"
+  s="$(printf '%s' "$s" | tr -c '[:alnum:]-_.' '-')"
+  s="$(printf '%s' "$s" | sed -e 's/-\{2,\}/-/g' -e 's/^[-.]//' -e 's/[-.]$//')"
+  [[ -z "$s" ]] && s="cocoon"
+  printf '%s' "$s"
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --name) NAME="${2:?--name needs a value}"; shift 2 ;;
+    --url) URL="${2:?--url needs a value}"; shift 2 ;;
+    --browser | --browser-bin) BROWSER="${2:?--browser needs a value}"; shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
+    --) shift; while (($# > 0)); do EXTRA+=("$1"); shift; done; break ;;
+    --*) echo "cocoon-launch-chrome: unknown flag: $1" >&2; usage >&2; exit 1 ;;
+    *)
+      if [[ -z "$URL" ]]; then URL="$1"; else EXTRA+=("$1"); fi
+      shift
+      ;;
+  esac
+done
+
+# A MimeType handler passes the clicked URL (%u) as an extra positional.
+# If the last extra arg looks like a URL scheme, it wins (e.g. mailto: link).
+if ((${#EXTRA[@]} > 0)); then
+  last="${EXTRA[${#EXTRA[@]} - 1]}"
+  if [[ "$last" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]]; then
+    URL="$last"
+    unset 'EXTRA[${#EXTRA[@]}-1]'
+  fi
+fi
+
+if [[ -z "$URL" ]]; then
+  echo "cocoon-launch-chrome: no URL given" >&2
+  usage >&2
+  exit 1
+fi
+if [[ ! "$URL" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]]; then
+  URL="https://$URL"
+fi
+
+if [[ -z "$NAME" ]]; then
+  host="${URL#*://}"
+  host="${host%%/*}"
+  NAME="$host"
+fi
+SLUG="$(slugify "$NAME")"
+
+# Browser detection: single source of truth lives in cocoon-browsers
+# (sourced for its candidate tables when present; hardcoded fallback keeps
+# old installs working when the helper is missing).
+BROWSERS_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cocoon-browsers"
+if [[ -f "$BROWSERS_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$BROWSERS_HELPER" 2>/dev/null || true
+fi
+
+CHROME_BIN=""
+IS_FLATPAK=false
+LAUNCH=()
+if [[ -n "$BROWSER" ]]; then
+  _requested="$BROWSER"
+  # Refuse an obvious engine mismatch early (a Gecko binary here would fail
+  # obscurely on --app). Known ids are authoritative; for a custom path the
+  # probe is only a safety guard — this launcher is already the chrome engine.
+  if declare -F cocoon_browser_engine >/dev/null 2>&1; then
+    _beng="$(cocoon_browser_engine "$BROWSER" 2>/dev/null || true)"
+    if [[ -z "$_beng" ]] && declare -F cocoon_browser_is_path >/dev/null 2>&1 &&
+      cocoon_browser_is_path "$BROWSER"; then
+      _beng="$(cocoon_browser_probe_engine "$BROWSER" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_beng" && "$_beng" != "chromium" ]]; then
+      echo "cocoon-launch-chrome: browser '$_requested' is a firefox-engine binary; use cocoon-launch-firefox for it" >&2
+      exit 1
+    fi
+  fi
+  if declare -F cocoon_browser_is_flatpak >/dev/null 2>&1 && cocoon_browser_is_flatpak "$BROWSER"; then
+    # Flatpak: the id is data, never a command. Build the whole `flatpak run`
+    # prefix as an argv array via the helper (one element per line) and bind
+    # only this tool's data root — per-run, never `flatpak override`.
+    IS_FLATPAK=true
+    if ! command -v flatpak >/dev/null 2>&1; then
+      echo "cocoon-launch-chrome: flatpak is not installed (needed for '$_requested')" >&2
+      exit 1
+    fi
+    _app="$(cocoon_browser_flatpak_app "$BROWSER" 2>/dev/null || true)"
+    if [[ -z "$_app" ]] || ! declare -F cocoon_browser_launch_argv >/dev/null 2>&1; then
+      echo "cocoon-launch-chrome: invalid flatpak browser id '$_requested'" >&2
+      exit 1
+    fi
+    if declare -F cocoon_browser_flatpak_installed >/dev/null 2>&1 &&
+      ! cocoon_browser_flatpak_installed "$_app"; then
+      echo "cocoon-launch-chrome: flatpak app '$_app' is not installed" >&2
+      exit 1
+    fi
+    mapfile -t LAUNCH < <(cocoon_browser_launch_argv "$BROWSER" "$DATA_ROOT" 2>/dev/null || true)
+    if ((${#LAUNCH[@]} == 0)); then
+      echo "cocoon-launch-chrome: could not build the flatpak launch command for '$_requested'" >&2
+      exit 1
+    fi
+    CHROME_BIN="$BROWSER"
+  else
+    # Resolve ids AND custom paths (with spaces) to an absolute executable.
+    if declare -F cocoon_browser_resolve >/dev/null 2>&1; then
+      CHROME_BIN="$(cocoon_browser_resolve "$BROWSER" 2>/dev/null || true)"
+    elif [[ "$BROWSER" == */* ]]; then
+      [[ -f "$BROWSER" && -x "$BROWSER" ]] && CHROME_BIN="$BROWSER" || true
+    else
+      command -v "$BROWSER" >/dev/null 2>&1 && CHROME_BIN="$BROWSER" || true
+    fi
+    if [[ -z "$CHROME_BIN" ]]; then
+      echo "cocoon-launch-chrome: pinned browser '$_requested' not found (not an executable file or PATH command)" >&2
+      echo "  Run 'cocoon-browsers' to list installed browsers, then recreate the app" >&2
+      echo "  (or edit its .desktop Exec line) with an available --browser/--browser-bin." >&2
+      exit 1
+    fi
+    BROWSER="$CHROME_BIN"
+    LAUNCH=("$CHROME_BIN")
+  fi
+else
+  if declare -F cocoon_default_browser >/dev/null 2>&1; then
+    CHROME_BIN="$(cocoon_default_browser chromium)"
+  else
+    # Fallback only for old installs lacking cocoon-browsers; kept in sync
+    # with its candidate table (the real source of truth).
+    for c in google-chrome-stable google-chrome chromium chromium-browser brave-browser brave vivaldi-stable vivaldi microsoft-edge-stable opera; do
+      if command -v "$c" >/dev/null 2>&1; then CHROME_BIN="$c"; break; fi
+    done
+  fi
+  LAUNCH=("$CHROME_BIN")
+fi
+if [[ -z "$CHROME_BIN" ]]; then
+  echo "cocoon-launch-chrome: no Chromium-based browser found (tried google-chrome-stable, chromium, brave, vivaldi, edge, opera)" >&2
+  echo "  Run 'cocoon-browsers' to see what is detected." >&2
+  exit 1
+fi
+
+DATA_DIR="$DATA_ROOT/chrome-${SLUG}"
+# Read fallback: reuse an existing legacy profile instead of silently creating
+# a fresh empty one. A missing profile still resolves to the NEW write root.
+if declare -F cocoon_find_profile >/dev/null 2>&1; then
+  _p="$(cocoon_find_profile chrome "$SLUG" 2>/dev/null || true)"
+  [[ -n "$_p" ]] && DATA_DIR="$_p"
+fi
+mkdir -p "$DATA_DIR"
+
+# Logs are always written to the canonical (new) root.
+LOG_FILE="$DATA_ROOT/${SLUG}.log"
+# Keep per-app logs bounded (append-only otherwise). Keep last ~500 lines.
+_cocoon_log_rotate() { # $1=file [max_bytes=262144]
+  local f="$1" max="${2:-262144}" sz
+  [[ -f "$f" ]] || return 0
+  sz="$(wc -c <"$f" 2>/dev/null || printf 0)"
+  [[ "$sz" =~ ^[0-9]+$ ]] || return 0
+  ((sz > max)) || return 0
+  local rot
+  rot="$(mktemp "${f}.cocoon.XXXXXX" 2>/dev/null)" || return 0
+  if tail -n 500 "$f" >"$rot" 2>/dev/null && mv -f "$rot" "$f" 2>/dev/null; then
+    :
+  else
+    rm -f "$rot" 2>/dev/null || true
+    : >"$f" 2>/dev/null || true
+  fi
+}
+log() {
+  _cocoon_log_rotate "$LOG_FILE"
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+# ---- link router: every link clicked inside the cocoon window opens in the
+# system default browser (xdg-open) instead of navigating the isolated
+# profile. Companion extension (ext/open-external) + native host
+# (cocoon-open-external). Best effort: a missing ext dir or a user-supplied
+# --load-extension simply disables routing (links behave as before).
+LINKOUT_EXT_ID="ojjpgedkhjmaochljkpgamkcmfnbhocl"
+LINKOUT_HOST_NAME="com.cocoon.open_external"
+LINKOUT_FLAGS=()
+LINKOUT_MANIFEST=""
+
+# Official branded Chrome 137+ ignores --load-extension (and
+# --disable-extensions-except), so the router cannot be injected there.
+# Chromium, Chrome for Testing and the forks we detect still accept it.
+linkout_extension_supported() {
+  local bin="$1" resolved="" base="" ver="" major="" branded=false
+  # Legacy apps may pin only an id; resolve it before any --version call.
+  if declare -F cocoon_browser_resolve >/dev/null 2>&1; then
+    resolved="$(cocoon_browser_resolve "$bin" 2>/dev/null || true)"
+    [[ -n "$resolved" ]] && bin="$resolved"
+  fi
+  base="${bin##*/}"
+  if declare -F cocoon_browser_version >/dev/null 2>&1; then
+    ver="$(cocoon_browser_version "$bin" 2>/dev/null || true)"
+  elif command -v timeout >/dev/null 2>&1; then
+    ver="$(timeout 5 "$bin" --version 2>/dev/null | head -n1 || true)"
+  else
+    ver="$("$bin" --version 2>/dev/null || true)"
+  fi
+  case "$base" in
+    google-chrome* | chrome) branded=true ;;
+  esac
+  # Custom wrappers: detect branded Chrome from the version tokens as well.
+  case "$ver" in
+    *"Google Chrome"*) branded=true ;;
+  esac
+  [[ "$branded" == "true" ]] || return 0
+  [[ "$ver" =~ ([0-9]+)\. ]] || return 0
+  major="${BASH_REMATCH[1]}"
+  if ((major >= 137)); then return 1; fi
+  return 0
+}
+
+install_linkout_manifest() { # $1 = destination path
+  local dest="$1" tmp
+  if [[ -f "$dest" ]] && cmp -s <(printf '%s' "$LINKOUT_MANIFEST") "$dest" 2>/dev/null; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || return 0
+  tmp="$(mktemp "$(dirname "$dest")/.cocoon-host.XXXXXX" 2>/dev/null)" || return 0
+  if printf '%s' "$LINKOUT_MANIFEST" >"$tmp" 2>/dev/null && mv -f "$tmp" "$dest" 2>/dev/null; then
+    log "link-router: registered native host at $dest"
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+}
+
+ensure_link_router() {
+  LINKOUT_FLAGS=()
+  local module_dir prefix_dir ext_dir host_bin cfgdirs=() cfg dest tmp
+  module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  prefix_dir="$(cd "$module_dir/.." && pwd)"
+
+  ext_dir=""
+  if declare -F cocoon_find_ext >/dev/null 2>&1; then
+    ext_dir="$(cocoon_find_ext 2>/dev/null || true)"
+  fi
+  if [[ -n "$ext_dir" && ! ( -f "$ext_dir/content.js" && -f "$ext_dir/background.js" ) ]]; then
+    ext_dir=""
+  fi
+  if [[ -z "$ext_dir" ]]; then
+    for cand in "$prefix_dir/ext/open-external" "$module_dir/../ext/open-external" "$HOME/.local/share/cocoon/ext/open-external"; do
+      if [[ -f "$cand/manifest.json" && -f "$cand/content.js" && -f "$cand/inject.js" && -f "$cand/background.js" ]]; then
+        ext_dir="$cand"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$ext_dir" ]]; then
+    log "link-router: ext dir missing (re-run install.sh); links stay in-app"
+    return 0
+  fi
+  if [[ "${EXTRA[*]:-}" == *"load-extension"* ]]; then
+    log "link-router: user passes --load-extension; skipping ours"
+    return 0
+  fi
+
+  # The native host must be reachable by the binary Chrome actually launches.
+  # The installer points manifests at the unified `cocoon` dispatcher; fall
+  # back to the standalone module for source checkouts.
+  host_bin="$prefix_dir/bin/cocoon"
+  [[ -x "$host_bin" ]] || host_bin="$module_dir/cocoon-open-external"
+  [[ -x "$host_bin" ]] || host_bin="$DATA_ROOT/bin/cocoon"
+  [[ -x "$host_bin" ]] || host_bin="$LEGACY_DATA_ROOT/bin/cocoon"
+  [[ -x "$host_bin" ]] || host_bin="$HOME/.local/share/webapps/bin/cocoon"
+  if [[ ! -x "$host_bin" ]]; then
+    log "link-router: native host missing; links stay in-app"
+    return 0
+  fi
+
+  if ! linkout_extension_supported "$CHROME_BIN"; then
+    log "link-router: $CHROME_BIN 137+ ignores --load-extension; links stay in-app"
+    return 0
+  fi
+
+  LINKOUT_MANIFEST="$(printf '{"name":"%s","description":"Cocoon: open webapp links in the default browser","path":"%s","type":"stdio","allowed_origins":["chrome-extension://%s/"]}' \
+    "$LINKOUT_HOST_NAME" "$host_bin" "$LINKOUT_EXT_ID")"
+
+  # PRIMARY: --user-data-dir overrides Chrome's default config dir, so the
+  # manifest must live inside THIS app's isolated profile. Writing only to
+  # ~/.config/<brand>/NativeMessagingHosts (the old behavior) made native
+  # messaging invisible to the very instance that needs it.
+  install_linkout_manifest "$DATA_DIR/NativeMessagingHosts/$LINKOUT_HOST_NAME.json"
+
+  # COMPATIBILITY: also register in detected brand config dirs. Other profiles
+  # of the same browser can then use the host too; harmless if unused.
+  local cfgdirs=() _seen=" "
+  if declare -F cocoon_browsers_native_rows >/dev/null 2>&1 && declare -F cocoon_browser_config_dir >/dev/null 2>&1; then
+    while IFS=$'\t' read -r _id _eng _bin _name _ver; do
+      [[ -z "$_id" ]] && continue
+      cfg="$(cocoon_browser_config_dir "$_id")"
+      [[ -n "$cfg" ]] && cfgdirs+=("$cfg")
+    done < <(cocoon_browsers_native_rows chromium)
+    cfg="$(cocoon_browser_config_dir "${CHROME_BIN##*/}")"
+    [[ -n "$cfg" ]] && cfgdirs+=("$cfg")
+  fi
+  if ((${#cfgdirs[@]} == 0)); then
+    cfgdirs=(google-chrome chromium "BraveSoftware/Brave-Browser" vivaldi microsoft-edge opera)
+  fi
+  for cfgdir in "${cfgdirs[@]}"; do
+    [[ "$_seen" == *"|$cfgdir|"* ]] && continue
+    _seen="$_seen|$cfgdir|"
+    install_linkout_manifest "$HOME/.config/$cfgdir/NativeMessagingHosts/$LINKOUT_HOST_NAME.json"
+  done
+
+  LINKOUT_FLAGS=("--disable-extensions-except=$ext_dir" "--load-extension=$ext_dir")
+  log "link-router: active (ext=$ext_dir)"
+}
+if [[ "$IS_FLATPAK" == "true" ]]; then
+  # A sandboxed Flatpak browser cannot see the host native-messaging host or
+  # load our unpacked extension. Never call linkout_extension_supported() or
+  # write host manifests with an id string: leave LINKOUT_FLAGS empty.
+  LINKOUT_FLAGS=()
+  log "link-router unsupported in sandbox (flatpak)"
+else
+  ensure_link_router
+fi
+
+printf '[%s] launch name=%s slug=%s url=%s browser=%s datadir=%s linkout=%s extra=%s\n' \
+  "$(date '+%F %T')" "$NAME" "$SLUG" "$URL" "$CHROME_BIN" "$DATA_DIR" "$([ ${#LINKOUT_FLAGS[@]} -gt 0 ] && echo on || echo off)" "${EXTRA[*]:-}" >>"$LOG_FILE" 2>/dev/null || true
+printf '[%s] exec: %s --ozone-platform-hint=auto --user-data-dir=%s --class=%s --app=%s %s %s\n' \
+  "$(date '+%F %T')" "${LAUNCH[*]}" "$DATA_DIR" "$SLUG" "$URL" "${LINKOUT_FLAGS[*]:-}" "${EXTRA[*]:-}" >>"$LOG_FILE" 2>/dev/null || true
+
+# --ozone-platform-hint=auto: run native Wayland under Plasma instead of
+# XWayland (XWayland cocoon windows can't match .desktop icons: KDE #358277).
+# No-op on X11 sessions.
+# LINKOUT_FLAGS: link-router extension (all clicks -> default browser).
+exec setsid "${LAUNCH[@]}" --ozone-platform-hint=auto --user-data-dir="$DATA_DIR" --class="$SLUG" "${LINKOUT_FLAGS[@]+"${LINKOUT_FLAGS[@]}"}" --app="$URL" "${EXTRA[@]}"

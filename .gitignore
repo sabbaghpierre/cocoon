@@ -3,9 +3,12 @@
 .DS_Store
 /tmp-*/
 
-# Never commit the compiled TUI: releases carry it, and bin/webapp-*
-# globs (installer copy, CI syntax check) must only ever see scripts.
+# Never commit the compiled TUI: releases carry it, and bin/cocoon's
+# directory must only ever see scripts.
+bin/cocoon-tui
 bin/webapp-tui
+tui/cocoon-tui
+tui/webapp-tui
 
 # Dart build outputs (pubspec.lock IS tracked: reproducible app builds)
 .dart_tool/

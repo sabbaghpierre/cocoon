@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# cocoon-icon — refresh a web app's icon without recreating the app.
+set -euo pipefail
+unset IFS GLOBIGNORE
+
+MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+usage() {
+  echo "Usage: cocoon icon <name> [icon-file|icon-url]"
+  echo "  With no REF, re-fetches the site's favicon from the current start URL."
+}
+
+if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then usage; exit 0; fi
+NAME="$1"; shift
+if (($# > 1)); then usage >&2; exit 1; fi
+
+if (($# == 1)); then
+  exec bash "$MODULE_DIR/cocoon-edit" "$NAME" --icon "$1"
+fi
+exec bash "$MODULE_DIR/cocoon-edit" "$NAME" --icon

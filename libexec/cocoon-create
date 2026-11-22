@@ -1,0 +1,814 @@
+#!/usr/bin/env bash
+# cocoon-create — create an isolated cocoon launcher (Omarchy-style) for Void/KDE.
+#
+# What it does (mirrors `omarchy-cocoon-install`):
+#   1. Takes name + URL (+ browser/engine + icon), prompting interactively if missing.
+#   2. Fetches the site favicon automatically, else asks for a PNG icon URL.
+#   3. Writes ~/.local/share/applications/<Name>.desktop with an isolated
+#      launcher Exec (per-app Chrome data dir OR per-app Firefox profile),
+#      pinned to the chosen browser via --browser.
+#   The app then shows up in Kickoff/KRunner like any native app.
+#
+# Browser vs engine: --engine (chrome|firefox) is the isolation technology
+# (category shorthand, back-compat); --browser is the concrete binary pinned
+# per-app (e.g. vivaldi-stable, ungoogled-chromium, librewolf, zen-browser).
+# `cocoon-browsers` lists valid --browser ids. When both are given they must
+# agree; when only --browser is given the engine is inferred; when only
+# --engine is given the default browser of that family is auto-pinned.
+# --browser-bin <path> pins any executable wrapper (absolute or relative,
+# paths with spaces allowed); custom paths need --engine unless the engine can
+# be detected from the binary. A --browser-bin value without '/' is a legacy
+# alias of --browser.
+#
+# Usage (prefer the unified CLI: `cocoon create ...`):
+#   cocoon create                                        # fully interactive
+#   cocoon create --name "ChatGPT" --url "https://chatgpt.com" --engine chrome
+#   cocoon create --name "YT" --url https://youtube.com --browser vivaldi-stable
+#   Flags: --name --url --engine(chrome|firefox) --browser(<id>)
+#          --browser-bin(<path>) --icon(URL|file)
+#          --mime(MimeType) --exec(custom Exec) --force --no-icon
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config (an IFS without space
+# silently disables word splitting; GLOBIGNORE can empty globs).
+unset IFS GLOBIGNORE
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+ICON_DIR="$HOME/.local/share/applications/icons"
+DESKTOP_DIR="$HOME/.local/share/applications"
+
+APP_NAME=""
+APP_URL=""
+ICON_REF=""
+ENGINE=""
+BROWSER=""
+CUSTOM_BROWSER_BIN=""
+MIME_TYPES=""
+CUSTOM_EXEC=""
+FORCE=false
+NO_ICON=false
+SKIP_ICON=false
+
+# Desktop Entry escaping. Exec values need backslash/dollar/backtick/quote
+# escaping and doubled percent signs; Name/Comment only need backslashes and
+# no newlines (a newline could inject arbitrary .desktop keys).
+exec_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//\$/\\\$}"
+  s="${s//\`/\\\`}"
+  s="${s//%/%%}"
+  printf '%s' "$s"
+}
+field_escape() {
+  local s="${1//\\/\\\\}"
+  s="${s//$'\n'/ }"
+  s="${s//$'\r'/ }"
+  printf '%s' "$s"
+}
+validate_name() {
+  case "$1" in
+    */* | *$'\n'* | *$'\r'* | *$'\t'*)
+      echo "cocoon create: app name cannot contain '/', newlines or tabs" >&2
+      exit 1
+      ;;
+  esac
+  [[ -n "$1" ]] || { echo "cocoon create: empty app name" >&2; exit 1; }
+}
+
+# Shared data/helper path resolution (source-only, stdout-silent).
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1090
+source "$_SCRIPT_DIR/cocoon-paths.sh" 2>/dev/null || true
+
+# cocoon_helper_path <filename> -> path or empty; hardcoded fallback keeps old
+# installs (without cocoon-paths.sh) working.
+cocoon_helper_path() {
+  local name="$1" cand
+  if declare -F cocoon_find_libexec_helper >/dev/null 2>&1; then
+    cocoon_find_libexec_helper "$name" 2>/dev/null || true
+    return 0
+  fi
+  for cand in "$_SCRIPT_DIR/$name" "$HOME/.local/share/cocoon/libexec/$name" \
+    "$HOME/.local/share/webapps/libexec/$name"; do
+    [[ -f "$cand" ]] && { printf '%s' "$cand"; return 0; }
+  done
+  return 0
+}
+
+# Browser detection lives in cocoon-browsers (single source of truth).
+# Source it early so flag/positional parsing can validate --browser ids.
+# Fallback tables below keep old installs working when the helper is missing.
+_browsers_helper="$(cocoon_helper_path cocoon-browsers || true)"
+if [[ -n "$_browsers_helper" ]]; then
+  # shellcheck disable=SC1090
+  source "$_browsers_helper" 2>/dev/null || true
+fi
+# Kept only for old installs lacking cocoon-browsers; kept in sync with the
+# candidate tables there (the real source of truth).
+_FALLBACK_CHROMIUM=(google-chrome-stable google-chrome chromium chromium-browser ungoogled-chromium brave-browser brave vivaldi-stable vivaldi microsoft-edge-stable opera thorium-browser)
+_FALLBACK_FIREFOX=(firefox firefox-esr librewolf zen-browser zen floorp waterfox)
+
+usage() {
+  sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'
+}
+
+has_gum() { command -v gum >/dev/null 2>&1; }
+
+slugify() {
+  local s="$1"
+  s="${s// /-}"
+  s="$(printf '%s' "$s" | tr -c '[:alnum:]-_.' '-')"
+  s="$(printf '%s' "$s" | sed -e 's/-\{2,\}/-/g' -e 's/^[-.]//' -e 's/[-.]$//')"
+  [[ -z "$s" ]] && s="cocoon"
+  printf '%s' "$s"
+}
+
+is_engine_token() {
+  case "$1" in
+    chrome | chromium | firefox | ff) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# is_browser_token <tok> — true if it names a concrete browser binary.
+is_browser_token() {
+  if declare -F cocoon_browser_known >/dev/null 2>&1; then
+    cocoon_browser_known "$1"
+    return $?
+  fi
+  local c
+  for c in ${_FALLBACK_CHROMIUM[@]+"${_FALLBACK_CHROMIUM[@]}"} ${_FALLBACK_FIREFOX[@]+"${_FALLBACK_FIREFOX[@]}"}; do
+    [[ "$c" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# browser_engine_of <id> -> chromium|firefox|"" (helper engine vocabulary)
+browser_engine_of() {
+  if declare -F cocoon_browser_engine >/dev/null 2>&1; then
+    cocoon_browser_engine "$1" || true
+    return 0
+  fi
+  local c
+  for c in ${_FALLBACK_CHROMIUM[@]+"${_FALLBACK_CHROMIUM[@]}"}; do
+    [[ "$c" == "$1" ]] && { printf 'chromium'; return 0; }
+  done
+  for c in ${_FALLBACK_FIREFOX[@]+"${_FALLBACK_FIREFOX[@]}"}; do
+    [[ "$c" == "$1" ]] && { printf 'firefox'; return 0; }
+  done
+  printf ''
+}
+
+# default_browser_for <chrome|firefox> -> binary id or empty
+default_browser_for() {
+  if declare -F cocoon_default_browser >/dev/null 2>&1; then
+    case "$1" in
+      chrome) cocoon_default_browser chromium ;;
+      firefox) cocoon_default_browser firefox ;;
+      *) printf '' ;;
+    esac
+    return 0
+  fi
+  local c list=()
+  if [[ "$1" == "chrome" ]]; then list=(${_FALLBACK_CHROMIUM[@]+"${_FALLBACK_CHROMIUM[@]}"});
+  elif [[ "$1" == "firefox" ]]; then list=(${_FALLBACK_FIREFOX[@]+"${_FALLBACK_FIREFOX[@]}"});
+  fi
+  for c in ${list[@]+"${list[@]}"}; do
+    if command -v "$c" >/dev/null 2>&1; then printf '%s' "$c"; return 0; fi
+  done
+  printf ''
+}
+
+# native_browser_rows — print TAB rows: id \t helper-engine \t display \t version
+native_browser_rows() {
+  if declare -F cocoon_browsers_native_rows >/dev/null 2>&1; then
+    cocoon_browsers_native_rows ""
+    return 0
+  fi
+  local id
+  for id in ${_FALLBACK_CHROMIUM[@]+"${_FALLBACK_CHROMIUM[@]}"}; do
+    if command -v "$id" >/dev/null 2>&1; then
+      printf '%s\tchromium\t%s\t%s\n' "$id" "$id" ""
+    fi
+  done
+  for id in ${_FALLBACK_FIREFOX[@]+"${_FALLBACK_FIREFOX[@]}"}; do
+    if command -v "$id" >/dev/null 2>&1; then
+      printf '%s\tfirefox\t%s\t%s\n' "$id" "$id" ""
+    fi
+  done
+}
+
+browser_display_of() {
+  if declare -F cocoon_browser_display_name >/dev/null 2>&1; then
+    cocoon_browser_display_name "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# Custom-binary helpers with graceful fallbacks for old installs lacking
+# cocoon-browsers. All are stdout-clean on failure.
+browser_is_path() {
+  if declare -F cocoon_browser_is_path >/dev/null 2>&1; then
+    cocoon_browser_is_path "$1"
+    return $?
+  fi
+  [[ "$1" == */* ]]
+}
+
+browser_resolve() {
+  local val="$1" dir resolved
+  if declare -F cocoon_browser_resolve >/dev/null 2>&1; then
+    cocoon_browser_resolve "$val" 2>/dev/null || true
+    return 0
+  fi
+  if [[ "$val" == */* ]]; then
+    [[ -f "$val" && -x "$val" ]] || return 0
+    dir="${val%/*}"; [[ -n "$dir" ]] || dir="/"
+    resolved="$(cd "$dir" 2>/dev/null && pwd)" || return 0
+    printf '%s/%s' "$resolved" "${val##*/}"
+    return 0
+  fi
+  command -v "$val" 2>/dev/null || true
+}
+
+# Flatpak id helpers with graceful fallbacks for old installs lacking the
+# extended cocoon-browsers (those installs have no flatpak mapping table, so
+# such ids are rejected as unknown before reaching the availability check).
+browser_is_flatpak() {
+  if declare -F cocoon_browser_is_flatpak >/dev/null 2>&1; then
+    cocoon_browser_is_flatpak "$1"
+    return $?
+  fi
+  [[ "${1:-}" == flatpak:* ]]
+}
+
+browser_flatpak_app() {
+  if declare -F cocoon_browser_flatpak_app >/dev/null 2>&1; then
+    cocoon_browser_flatpak_app "$1"
+    return $?
+  fi
+  local val="${1:-}"
+  [[ "$val" == flatpak:* ]] || return 1
+  val="${val#flatpak:}"
+  [[ "$val" =~ ^[A-Za-z0-9_.-]+$ && "$val" == *.* ]] || return 1
+  printf '%s' "$val"
+}
+
+browser_flatpak_installed() {
+  if declare -F cocoon_browser_flatpak_installed >/dev/null 2>&1; then
+    cocoon_browser_flatpak_installed "$1"
+    return $?
+  fi
+  command -v flatpak >/dev/null 2>&1 || return 1
+  flatpak info "$1" >/dev/null 2>&1
+}
+
+browser_probe_engine() {
+  local val="$1" base ver
+  if declare -F cocoon_browser_probe_engine >/dev/null 2>&1; then
+    cocoon_browser_probe_engine "$val" 2>/dev/null || true
+    return 0
+  fi
+  base="${val##*/}"
+  _beng="$(browser_engine_of "$base" 2>/dev/null || true)"
+  if [[ -n "$_beng" ]]; then printf '%s' "$_beng"; return 0; fi
+  if declare -F cocoon_browser_version >/dev/null 2>&1; then
+    ver="$(cocoon_browser_version "$val" 2>/dev/null || true)"
+  else
+    ver="$(timeout 5 "$val" --version 2>/dev/null | head -n1 || true)"
+  fi
+  case "$ver" in
+    *Firefox* | *LibreWolf* | *Zen* | *Waterfox* | *Floorp*) printf 'firefox' ;;
+    *Chrome* | *Chromium* | *Brave* | *Vivaldi* | *Edge* | *Opera* | *Thorium* | *Ungoogled*) printf 'chromium' ;;
+  esac
+  return 0
+}
+
+# A MIME type (e.g. x-scheme-handler/mailto) vs a custom Exec command:
+# MIME has type/subtype form with no spaces and no %u placeholder.
+looks_like_mime() {
+  [[ "$1" == *"/"* && "$1" != *" "* && "$1" != *"%u"* ]]
+}
+
+normalize_engine() {
+  case "$1" in
+    chrome | chromium) printf 'chrome' ;;
+    firefox | ff) printf 'firefox' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+prompt_input() { # $1=prompt $2=placeholder -> stdout
+  if has_gum; then
+    gum input --prompt "$1> " --placeholder "$2"
+  else
+    printf '%s> ' "$1" >&2
+    IFS= read -r reply || reply=""
+    printf '%s' "$reply"
+  fi
+}
+
+# ---- parse flags ----
+POS=()
+while (($# > 0)); do
+  case "$1" in
+    --name) APP_NAME="${2:?--name needs a value}"; shift 2 ;;
+    --url) APP_URL="${2:?--url needs a value}"; shift 2 ;;
+    --icon) ICON_REF="${2:?--icon needs a value}"; shift 2 ;;
+    --engine) ENGINE="${2:?--engine needs a value}"; shift 2 ;;
+    --browser) BROWSER="${2:?--browser needs a value}"; shift 2 ;;
+    --browser-bin)
+      _bin_arg="${2:?--browser-bin needs a value}"
+      if browser_is_path "$_bin_arg"; then
+        CUSTOM_BROWSER_BIN="$_bin_arg"
+      else
+        # Legacy alias: a bare name is still just --browser.
+        BROWSER="$_bin_arg"
+      fi
+      shift 2
+      ;;
+    --mime | --mime-types) MIME_TYPES="${2:?--mime needs a value}"; shift 2 ;;
+    --exec) CUSTOM_EXEC="${2:?--exec needs a value}"; shift 2 ;;
+    --force) FORCE=true; shift ;;
+    --no-icon) NO_ICON=true; shift ;;
+    -h | --help) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
+    --) shift; while (($# > 0)); do POS+=("$1"); shift; done; break ;;
+    --*) echo "cocoon-create: unknown flag: $1" >&2; usage >&2; exit 1 ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+
+# ---- positional fallback (Omarchy order: name url [icon] [custom-exec] [mime],
+#      with engine accepted in slot 3 or 4) ----
+if ((${#POS[@]} > 0)) && [[ -z "$APP_NAME" ]]; then APP_NAME="${POS[0]}"; fi
+if ((${#POS[@]} > 1)) && [[ -z "$APP_URL" ]]; then APP_URL="${POS[1]}"; fi
+p3="${POS[2]:-}"; p4="${POS[3]:-}"; p5="${POS[4]:-}"; p6="${POS[5]:-}"
+if [[ -n "$p6" ]]; then echo "cocoon-create: too many positional args" >&2; usage >&2; exit 1; fi
+# Engine or concrete browser id may sit in any of slots 3-5; remaining
+# tokens keep Omarchy order: icon, custom-exec, mime-types.
+rest=()
+for tok in "$p3" "$p4" "$p5"; do
+  [[ -n "$tok" ]] || continue
+  if is_engine_token "$tok" && [[ -z "$ENGINE" ]]; then ENGINE="$tok";
+  elif is_browser_token "$tok" && [[ -z "$BROWSER" ]]; then BROWSER="$tok";
+  else rest+=("$tok"); fi
+done
+if ((${#rest[@]} > 0)) && [[ -z "$ICON_REF" ]]; then ICON_REF="${rest[0]}"; fi
+if ((${#rest[@]} > 1)); then
+  if looks_like_mime "${rest[1]}" && [[ -z "$MIME_TYPES" ]]; then
+    MIME_TYPES="${rest[1]}"
+  elif [[ -z "$CUSTOM_EXEC" ]]; then
+    CUSTOM_EXEC="${rest[1]}"
+  fi
+fi
+if ((${#rest[@]} > 2)) && [[ -z "$MIME_TYPES" ]]; then MIME_TYPES="${rest[2]}"; fi
+if ((${#rest[@]} > 3)); then echo "cocoon-create: too many positional args" >&2; usage >&2; exit 1; fi
+
+# Defaults from `cocoon config` (flags always win).
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/cocoon/config"
+CONFIG_CATEGORIES=""
+if [[ -f "$CONFIG_FILE" ]]; then
+  [[ -z "$ENGINE" ]] && ENGINE="$(sed -n 's/^engine=//p' "$CONFIG_FILE" | head -n1 || true)"
+  if [[ -z "$BROWSER" && -z "$CUSTOM_BROWSER_BIN" ]]; then
+    _cfg_browser="$(sed -n 's/^browser=//p' "$CONFIG_FILE" | head -n1 || true)"
+    if browser_is_path "$_cfg_browser"; then
+      CUSTOM_BROWSER_BIN="$_cfg_browser"
+    else
+      BROWSER="$_cfg_browser"
+    fi
+  fi
+  CONFIG_CATEGORIES="$(sed -n 's/^categories=//p' "$CONFIG_FILE" | head -n1 || true)"
+fi
+INTERACTIVE_MODE=false
+if [[ -z "$APP_NAME" || -z "$APP_URL" || ( -z "$ENGINE" && -z "$BROWSER" && -z "$CUSTOM_BROWSER_BIN" ) ]]; then INTERACTIVE_MODE=true; fi
+
+# ---- interactive prompts for anything missing ----
+if [[ -z "$APP_NAME" ]]; then
+  if has_gum; then echo -e "\e[32mLet's create a new web app you can start with your app launcher.\n\e[0m"; fi
+  APP_NAME="$(prompt_input "Name" "My favorite web app")"
+fi
+if [[ -z "$APP_URL" ]]; then
+  APP_URL="$(prompt_input "URL" "https://example.com")"
+fi
+if [[ ! "$APP_URL" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]]; then
+  APP_URL="https://$APP_URL"
+fi
+# Browser picker: concrete browser list from detection. Falls back to the
+# legacy 2-option engine prompt only when no native browser is detected
+# (or the helper is missing and PATH has none of the fallback ids).
+pick_browser_interactive() {
+  local rows
+  rows="$(native_browser_rows)"
+  if [[ -z "$rows" ]]; then return 1; fi
+  local ids=() labels=() id beng disp ver
+  while IFS=$'\t' read -r id beng _bin disp ver; do
+    [[ -z "$id" ]] && continue
+    [[ -z "$disp" ]] && disp="$(browser_display_of "$id")"
+    ids+=("$id")
+    if [[ -n "$ver" ]]; then
+      labels+=("$disp ($id) [$beng] $ver")
+    else
+      labels+=("$disp ($id) [$beng]")
+    fi
+  done <<<"$rows"
+  if ((${#ids[@]} == 0)); then return 1; fi
+  if ((${#ids[@]} == 1)); then
+    BROWSER="${ids[0]}"
+    echo "Browser: $BROWSER (only one detected)" >&2
+    return 0
+  fi
+  if has_gum; then
+    local picked i
+    picked="$(gum choose --header "Browser? (isolated profile in the selected browser)" "${labels[@]}")"
+    for i in "${!ids[@]}"; do
+      if [[ "${labels[$i]}" == "$picked" ]]; then BROWSER="${ids[$i]}"; return 0; fi
+    done
+    return 1
+  else
+    echo "Browser? (isolated per-app profile in the selected browser)" >&2
+    local i
+    for i in "${!ids[@]}"; do
+      printf '  %d) %s\n' "$((i + 1))" "${labels[$i]}" >&2
+    done
+    printf 'Choice [1/%d or browser id]> ' "${#ids[@]}" >&2
+    IFS= read -r choice || choice=""
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#ids[@]})); then
+      BROWSER="${ids[$((choice - 1))]}"
+      return 0
+    fi
+    for i in "${!ids[@]}"; do
+      if [[ "${ids[$i]}" == "$choice" ]]; then BROWSER="${ids[$i]}"; return 0; fi
+    done
+    # Default: first detected.
+    BROWSER="${ids[0]}"
+    return 0
+  fi
+}
+pick_engine_legacy() {
+  if has_gum; then
+    ENGINE="$(gum choose --header "Engine? (chrome = --app window, firefox = minimal-UI profile)" "chrome" "firefox")"
+  else
+    echo "Engine? (isolated per-app data in both cases)" >&2
+    echo "  1) chrome  (--app SSB window)" >&2
+    echo "  2) firefox (dedicated profile + hidden toolbars)" >&2
+    printf 'Choice [1/2]> ' >&2
+    IFS= read -r choice || choice=""
+    case "$choice" in
+      2 | firefox | ff) ENGINE="firefox" ;;
+      *) ENGINE="chrome" ;;
+    esac
+  fi
+}
+if [[ -z "$BROWSER" && -z "$ENGINE" && -z "$CUSTOM_BROWSER_BIN" ]]; then
+  if ! pick_browser_interactive; then
+    pick_engine_legacy
+  fi
+fi
+# Normalize + reconcile engine/browser (both flags kept; they must agree).
+if [[ -n "$ENGINE" ]]; then
+  ENGINE="$(normalize_engine "$ENGINE")"
+  if [[ "$ENGINE" != "chrome" && "$ENGINE" != "firefox" ]]; then
+    echo "cocoon-create: engine must be 'chrome' or 'firefox', got '$ENGINE'" >&2
+    exit 1
+  fi
+fi
+if [[ -n "$CUSTOM_BROWSER_BIN" ]]; then
+  # Custom path: resolve to an absolute executable, infer the engine from an
+  # explicit --engine (authoritative) or from a best-effort probe. Only a
+  # CONFIDENT probe mismatch is fatal; an empty probe just needs --engine.
+  _resolved="$(browser_resolve "$CUSTOM_BROWSER_BIN")"
+  if [[ -z "$_resolved" || ! -f "$_resolved" || ! -x "$_resolved" ]]; then
+    echo "cocoon-create: custom browser '$CUSTOM_BROWSER_BIN' is not an executable file" >&2
+    exit 1
+  fi
+  CUSTOM_BROWSER_BIN="$_resolved"
+  BROWSER="$_resolved"
+  _probe="$(browser_probe_engine "$CUSTOM_BROWSER_BIN")"
+  if [[ -n "$ENGINE" ]]; then
+    _want="$ENGINE"
+    [[ "$_want" == "chrome" ]] && _want="chromium"
+    if [[ -n "$_probe" && "$_probe" != "$_want" ]]; then
+      echo "cocoon-create: --browser-bin '$CUSTOM_BROWSER_BIN' is a $_probe browser, but --engine is '$ENGINE'" >&2
+      exit 1
+    fi
+  else
+    if [[ -z "$_probe" ]]; then
+      echo "cocoon-create: could not detect the engine of custom browser '$CUSTOM_BROWSER_BIN'; pass --engine chrome|firefox" >&2
+      exit 1
+    fi
+    [[ "$_probe" == "chromium" ]] && ENGINE="chrome" || ENGINE="firefox"
+  fi
+elif [[ -n "$BROWSER" ]]; then
+  _beng="$(browser_engine_of "$BROWSER")"
+  if [[ -z "$_beng" ]]; then
+    echo "cocoon-create: unknown browser '$BROWSER' (run 'cocoon-browsers --list')" >&2
+    exit 1
+  fi
+  if browser_is_flatpak "$BROWSER"; then
+    # Source-aware check: flatpak binary present, strict app-id syntax, app
+    # actually installed, and engine known via the flatpak mapping table
+    # (browser_engine_of above already rejected unmapped ids as unknown).
+    _app="$(browser_flatpak_app "$BROWSER")"
+    if ! command -v flatpak >/dev/null 2>&1; then
+      echo "cocoon-create: browser '$BROWSER' needs flatpak, but 'flatpak' is not installed" >&2
+      exit 1
+    fi
+    if [[ -z "$_app" ]]; then
+      echo "cocoon-create: invalid flatpak browser id '$BROWSER' (expected flatpak:<app-id>)" >&2
+      exit 1
+    fi
+    if ! browser_flatpak_installed "$_app"; then
+      echo "cocoon-create: flatpak app '$_app' is not installed (run 'cocoon-browsers')" >&2
+      exit 1
+    fi
+  elif ! command -v "$BROWSER" >/dev/null 2>&1; then
+    echo "cocoon-create: browser '$BROWSER' not found on PATH (run 'cocoon-browsers')" >&2
+    exit 1
+  fi
+  # Helper speaks chromium|firefox; ENGINE speaks chrome|firefox.
+  _want="$ENGINE"
+  [[ "$_want" == "chrome" ]] && _want="chromium"
+  if [[ -z "$ENGINE" ]]; then
+    [[ "$_beng" == "chromium" ]] && ENGINE="chrome" || ENGINE="firefox"
+  elif [[ "$_want" != "$_beng" ]]; then
+    echo "cocoon-create: --browser '$BROWSER' is a $_beng browser, but --engine is '$ENGINE'" >&2
+    exit 1
+  fi
+else
+  # Engine-only path: auto-pin the default browser of that family.
+  BROWSER="$(default_browser_for "$ENGINE")"
+fi
+
+if [[ -z "$APP_NAME" || -z "$APP_URL" ]]; then
+  echo "cocoon-create: you must set app name and app URL!" >&2
+  exit 1
+fi
+validate_name "$APP_NAME"
+
+SLUG="$(slugify "$APP_NAME")"
+# Freedesktop-canonical icon storage: hicolor theme + bare Icon name.
+# (Absolute-path Icon= values have taskmanager-specific rendering quirks.)
+HICOLOR_DIR="$HOME/.local/share/icons/hicolor/128x128/apps"
+
+mkdir -p "$ICON_DIR" "$DESKTOP_DIR" "$HICOLOR_DIR"
+
+# Guard against silent overwrites. Two different names can slugify to the same
+# value ("My App" / "My-App"); they would share icon, log and BROWSER PROFILE,
+# and --purge on one would delete the other's logins.
+DESKTOP_FILE="$DESKTOP_DIR/$APP_NAME.desktop"
+if [[ -e "$DESKTOP_FILE" && "$FORCE" != "true" ]]; then
+  echo "cocoon create: an app named '$APP_NAME' already exists ($DESKTOP_FILE)." >&2
+  echo "  Use --force to replace it, or 'cocoon edit $APP_NAME' to change it." >&2
+  exit 1
+fi
+if [[ "$FORCE" != "true" ]]; then
+  for existing in "$DESKTOP_DIR"/*.desktop; do
+    [[ -f "$existing" ]] || continue
+    [[ "$existing" == "$DESKTOP_FILE" ]] && continue
+    if grep -qxF "Icon=$SLUG" "$existing" 2>/dev/null; then
+      echo "cocoon create: slug '$SLUG' is already used by $(basename "$existing")." >&2
+      echo "  Different names can collide after slugification; rename this app." >&2
+      exit 1
+    fi
+  done
+fi
+
+TMP_ICON=""
+cleanup_tmp_icon() { [[ -n "${TMP_ICON:-}" ]] && rm -f "$TMP_ICON" || true; }
+trap cleanup_tmp_icon EXIT
+
+# ---- favicon auto-fetch first (Omarchy behavior), prompt only on failure ----
+# Only the HOSTNAME is sent to Google's favicon service: passing the whole URL
+# corrupts any query string and leaks paths/tokens to a third party.
+urlencode() {
+  local s="$1" out="" i c hex
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+favicon_host() {
+  local u="${1#*://}"
+  u="${u%%/*}"; u="${u%%\?*}"; u="${u%%#*}"
+  u="${u##*@}"
+  if [[ "$u" == \[*\]* ]]; then u="${u#\[}"; u="${u%%\]*}"; else u="${u%%:*}"; fi
+  printf '%s' "$u"
+}
+
+ICON_SRC=""
+if [[ "$NO_ICON" == "true" ]]; then
+  ICON_VALUE=""
+  SKIP_ICON=true
+elif [[ -z "$ICON_REF" ]]; then
+  FAVICON_URL="https://www.google.com/s2/favicons?domain=$(urlencode "$(favicon_host "$APP_URL")")&sz=128"
+  TMP_ICON="$(mktemp /tmp/cocoon-icon-XXXXXX.png)"
+  if curl -fsSL --max-time 15 -o "$TMP_ICON" "$FAVICON_URL" 2>/dev/null && [[ -s "$TMP_ICON" ]]; then
+    ICON_SRC="$TMP_ICON"
+  elif [[ "$INTERACTIVE_MODE" == "true" ]]; then
+    ICON_REF="$(prompt_input "Icon URL" "Could not fetch favicon automatically. Enter PNG icon URL (see https://dashboardicons.com)")"
+  else
+    echo "cocoon-create: warning: could not fetch favicon (offline?); app will use the default icon." >&2
+    ICON_VALUE=""
+    SKIP_ICON=true
+  fi
+fi
+
+# ---- resolve icon to a source file ----
+if [[ -z "$ICON_SRC" && "$SKIP_ICON" != "true" ]]; then
+  if [[ "$ICON_REF" =~ ^https?:// ]]; then
+    if [[ -z "$TMP_ICON" ]]; then TMP_ICON="$(mktemp /tmp/cocoon-icon-XXXXXX.png)"; fi
+    if ! curl -fsSL -o "$TMP_ICON" "$ICON_REF" || [[ ! -s "$TMP_ICON" ]]; then
+      echo "cocoon-create: error: failed to download icon." >&2
+      exit 1
+    fi
+    ICON_SRC="$TMP_ICON"
+  elif [[ -f "$ICON_REF" ]]; then
+    ICON_SRC="$ICON_REF"
+  elif [[ -f "$ICON_DIR/$ICON_REF" ]]; then
+    ICON_SRC="$ICON_DIR/$ICON_REF"
+  else
+    echo "cocoon-create: error: icon file not found: $ICON_REF" >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "$ICON_SRC" ]]; then
+  # Sanity: refuse non-images (keeps error pages out of the icon theme).
+  if command -v file >/dev/null 2>&1 && ! file -b "$ICON_SRC" | grep -qi 'image'; then
+    echo "cocoon-create: error: icon is not an image: $ICON_SRC ($(file -b "$ICON_SRC"))" >&2
+    exit 1
+  fi
+  # ---- install into the hicolor theme under the slug name ----
+  cp -f "$ICON_SRC" "$HICOLOR_DIR/$SLUG.png"
+  chmod 644 "$HICOLOR_DIR/$SLUG.png"
+  ICON_VALUE="$SLUG"
+fi
+
+# ---- engine sanity warnings (non-fatal; BROWSER empty = nothing detected) ----
+if [[ "$ENGINE" == "chrome" && -z "$BROWSER" ]]; then
+  echo "cocoon-create: warning: no Chromium-based browser found; install google-chrome or chromium for the 'chrome' engine." >&2
+fi
+if [[ "$ENGINE" == "firefox" && -z "$BROWSER" ]]; then
+  echo "cocoon-create: warning: no Firefox-family browser found on PATH (run 'cocoon-browsers')." >&2
+fi
+if [[ "$BROWSER" == "librewolf" ]]; then
+  echo "cocoon-create: note: LibreWolf clears cookies/history aggressively by default;" >&2
+  echo "  relax that inside the cocoon if logins don't stick." >&2
+fi
+if [[ "$ENGINE" == "firefox" ]]; then
+  echo "cocoon-create: note: firefox-engine apps keep link clicks inside the cocoon window" >&2
+  echo "  (Mozilla add-on signing blocks the link router there); pick a chromium" >&2
+  echo "  browser if you want clicks to open in your system default browser." >&2
+fi
+
+# ---- Exec line (absolute launcher path: Plasma/KRunner do NOT inherit
+# the toolkit dir from .bashrc, so a bare command name fails to resolve) ----
+# (SLUG was computed in the icon section above.)
+LAUNCHER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Helpers (optional — install proceeds without them).
+KWIN_HELPER="$(cocoon_helper_path cocoon-kwin.sh || true)"
+if [[ -n "$KWIN_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$KWIN_HELPER"
+fi
+ENV_HELPER="$(cocoon_helper_path cocoon-env.sh || true)"
+if [[ -n "$ENV_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_HELPER"
+fi
+# compositor(): plasma|niri|hyprland|sway|gnome|unknown (plasma if undetectable).
+compositor() {
+  if declare -F cocoon_compositor >/dev/null 2>&1; then
+    cocoon_compositor
+  else
+    printf 'plasma'
+  fi
+}
+# Chromium ignores --class with --app=, so windows report a derived id
+# (chrome-<host>__-Default). Match THAT for taskbar/titlebar icons.
+WM_MATCH="$SLUG"
+if [[ "$ENGINE" == "chrome" ]] && declare -F cocoon_chrome_id >/dev/null 2>&1; then
+  WM_MATCH="$(cocoon_chrome_id "$APP_URL")"
+fi
+if [[ -n "$CUSTOM_EXEC" ]]; then
+  EXEC_COMMAND="$CUSTOM_EXEC"
+else
+  # Generated .desktop files call the UNIFIED dispatcher with an absolute
+  # path (KRunner does not inherit the shell PATH). Older installs may still
+  # lack bin/cocoon, in which case we fall back to the direct module.
+  PREFIX_DIR="$(cd "$LAUNCHER_DIR/.." && pwd)"
+  COCOON_BIN="$PREFIX_DIR/bin/cocoon"
+  if [[ -x "$COCOON_BIN" ]]; then
+    LAUNCH_PREFIX="$COCOON_BIN launch $ENGINE"
+  elif [[ "$ENGINE" == "chrome" ]]; then
+    LAUNCH_PREFIX="$LAUNCHER_DIR/cocoon-launch-chrome"
+  else
+    LAUNCH_PREFIX="$LAUNCHER_DIR/cocoon-launch-firefox"
+  fi
+  # Pin the concrete browser so the app always opens in what the user picked
+  # (omitted only when nothing was detected — legacy first-found behavior).
+  _BROWSER_FLAG=""
+  [[ -n "$BROWSER" ]] && _BROWSER_FLAG=" --browser \"$(exec_escape "$BROWSER")\""
+  EXEC_COMMAND="$LAUNCH_PREFIX$_BROWSER_FLAG --name \"$(exec_escape "$APP_NAME")\" --url \"$(exec_escape "$APP_URL")\""
+  if [[ -n "$MIME_TYPES" && "$EXEC_COMMAND" != *"%u"* ]]; then
+    EXEC_COMMAND="$EXEC_COMMAND %u"
+  fi
+fi
+
+ENGINE_LABEL="$ENGINE"
+[[ -n "$BROWSER" ]] && ENGINE_LABEL="$ENGINE ($BROWSER)"
+ICON_LINE=""
+[[ -n "$ICON_VALUE" ]] && ICON_LINE="Icon=$ICON_VALUE"
+# Write atomically: a failed write must never leave a half-created launcher.
+DESKTOP_TMP="$(mktemp "$DESKTOP_DIR/.cocoon-desktop.XXXXXX")" || {
+  echo "cocoon-create: could not create temporary desktop file" >&2
+  exit 1
+}
+{
+  cat <<EOF
+[Desktop Entry]
+Version=1.0
+Name=$(field_escape "$APP_NAME")
+Comment=$(field_escape "$APP_NAME") (cocoon, $ENGINE_LABEL, isolated)
+Exec=$EXEC_COMMAND
+Terminal=false
+Type=Application
+$ICON_LINE
+StartupNotify=true
+StartupWMClass=$WM_MATCH
+Categories=${CONFIG_CATEGORIES:-Network;WebBrowser};
+Keywords=$(field_escape "$SLUG");cocoon;
+Actions=open-browser;
+EOF
+  if [[ -n "$MIME_TYPES" ]]; then
+    [[ "$MIME_TYPES" == *";" ]] || MIME_TYPES="${MIME_TYPES};"
+    printf 'MimeType=%s\n' "$MIME_TYPES"
+  fi
+  cat <<EOF
+
+[Desktop Action open-browser]
+Name=Open in default browser
+Exec=xdg-open "$(exec_escape "$APP_URL")"
+EOF
+} >"$DESKTOP_TMP"
+chmod +x "$DESKTOP_TMP" && mv -f "$DESKTOP_TMP" "$DESKTOP_FILE"
+
+chmod +x "$DESKTOP_FILE"
+
+# Refresh KDE's app index if available; never fail the install on this.
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+  kbuildsycoca6 >/dev/null 2>&1 || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+fi
+
+# KWin rule forcing window -> .desktop association (Plasma only; other
+# compositors match natively via app_id + StartupWMClass).
+# Chrome regex covers both worlds: slug (--class, if honored) and Chromium's
+# derived id (--class ignored, the common case). Firefox: slug matches the
+# --name app_id the launcher sets (plus StartupWMClass); the rule is
+# insurance against compositor/Firefox matching regressions.
+if [[ "$(compositor)" == "plasma" ]] && declare -F kwin_rule_add >/dev/null 2>&1; then
+  if [[ "$ENGINE" == "chrome" ]]; then
+    WM_PATTERN="($(cocoon_regex_escape "$SLUG")|$(cocoon_regex_escape "$WM_MATCH"))"
+  else
+    WM_PATTERN="($(cocoon_regex_escape "$SLUG"))"
+  fi
+  kwin_rule_add "$APP_NAME" "$APP_NAME" "$WM_PATTERN"
+  kwin_reconfigure || true
+fi
+
+echo "Created '$APP_NAME' ($ENGINE_LABEL, isolated). Find it in your app launcher."
+echo "Note: isolated profile — log in once inside the cocoon window."
+echo "Tip: permission popup stuck? Hover the top edge, move onto the popup,"
+echo "     click Allow once (remembered forever; ends any retry loop)."
+if ! command -v gum >/dev/null 2>&1; then
+  if declare -F cocoon_install_cmd >/dev/null 2>&1; then
+    GUM_TIP="$(cocoon_install_cmd gum)"
+    [[ -n "$GUM_TIP" ]] && echo "Tip: $GUM_TIP  (for the Omarchy-style interactive prompts)"
+  else
+    echo "Tip: sudo xbps-install -S gum  (for the Omarchy-style interactive prompts)"
+  fi
+fi

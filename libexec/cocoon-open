@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# cocoon-open — launch an installed web app by name.
+# Reads the app's .desktop file and reuses the normal launcher, so the app
+# keeps its isolated profile, browser pin and WM class.
+set -euo pipefail
+unset IFS GLOBIGNORE
+
+MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DESKTOP_DIR="$HOME/.local/share/applications"
+
+usage() {
+  echo "Usage: cocoon open <name>"
+  echo "       cocoon list   # to see installed apps"
+}
+
+if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then usage; exit 0; fi
+NAME="$1"
+
+unescape_field() {
+  printf '%s' "$1" | sed -e 's/\\\\/\\/g' -e 's/\\"/"/g' -e 's/\\\$/$/g' -e 's/\\`/`/g' -e 's/%%/%/g'
+}
+
+desktop="$DESKTOP_DIR/$NAME.desktop"
+if [[ ! -f "$desktop" ]]; then
+  # Be forgiving: accept a slug/name returned by `cocoon list --json` too.
+  match=""
+  for f in "$DESKTOP_DIR"/*.desktop; do
+    [[ -f "$f" ]] || continue
+    [[ "$(basename "$f" .desktop)" == "$NAME" ]] && { match="$f"; break; }
+  done
+  [[ -n "$match" ]] && desktop="$match"
+fi
+[[ -f "$desktop" ]] || { echo "cocoon open: no app named '$NAME' (run 'cocoon list')" >&2; exit 1; }
+
+exec_line="$(sed -n 's/^Exec=//p' "$desktop" | head -n1 || true)"
+url="$(printf '%s' "$exec_line" | sed -n 's/.*--url "\([^"]*\)".*/\1/p;s/.*--url \([^ "]*\).*/\1/p' | head -n1 || true)"
+browser="$(printf '%s' "$exec_line" | sed -n 's/.*--browser "\([^"]*\)".*/\1/p;s/.*--browser \([^ "]*\).*/\1/p' | head -n1 || true)"
+app_name="$(sed -n 's/^Name=//p' "$desktop" | head -n1 || true)"
+
+engine=""
+if [[ "$exec_line" == *"cocoon-launch-chrome"* || "$exec_line" == *" launch chrome "* ]]; then engine="chrome"; fi
+if [[ "$exec_line" == *"cocoon-launch-firefox"* || "$exec_line" == *" launch firefox "* ]]; then engine="firefox"; fi
+if [[ -z "$engine" ]]; then
+  echo "cocoon open: '$NAME' has a custom Exec line; launch it from your app menu instead." >&2
+  exit 1
+fi
+url="$(unescape_field "$url")"
+app_name="$(unescape_field "${app_name:-$NAME}")"
+[[ -n "$url" ]] || { echo "cocoon open: no URL found in $desktop" >&2; exit 1; }
+
+ARGS=(--name "$app_name" --url "$url")
+[[ -n "$browser" ]] && ARGS+=(--browser "$browser")
+exec bash "$MODULE_DIR/cocoon-launch-$engine" "${ARGS[@]}"

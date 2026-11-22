@@ -28,6 +28,8 @@ class DashboardScreen extends StatefulComponent {
 class _DashboardScreenState extends State<DashboardScreen> {
   List<WebApp>? apps;
   String? error;
+  String? notice;
+  bool noticeOk = true;
   int selected = 0;
 
   @override
@@ -36,17 +38,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _load();
   }
 
+  @override
+  void dispose() {
+    super.dispose();
+  }
+
   Future<void> _load() async {
     setState(() {
       apps = null;
       error = null;
+      notice = null;
     });
     try {
       final loaded = await component.backend.listApps();
       if (!mounted) return;
       setState(() {
         apps = loaded;
-        if (selected >= loaded.length) selected = 0;
+        if (selected < 0 || selected >= loaded.length) selected = 0;
       });
     } on BackendException catch (e) {
       if (!mounted) return;
@@ -54,8 +62,36 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
+  Future<void> _openSelected() async {
+    final items = apps;
+    if (items == null || selected < 0 || selected >= items.length) return;
+    final name = items[selected].name;
+    try {
+      final r = await component.backend.openApp(name);
+      if (!mounted) return;
+      setState(() {
+        noticeOk = r.ok;
+        notice = r.ok
+            ? (r.output.trim().isEmpty ? 'Opened $name' : r.output.trim())
+            : (r.output.trim().isEmpty
+                  ? 'Could not open $name'
+                  : r.output.trim());
+      });
+    } on BackendException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        noticeOk = false;
+        notice = e.message;
+      });
+    }
+  }
+
   bool _onKey(KeyboardEvent event) {
     final items = apps ?? const <WebApp>[];
+    if (event.logicalKey == LogicalKey.enter) {
+      _openSelected();
+      return true;
+    }
     if (event.logicalKey == LogicalKey.arrowDown) {
       if (items.isNotEmpty) {
         setState(() => selected = (selected + 1) % items.length);
@@ -89,7 +125,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
         component.onOpen(AppScreen.remove);
         return true;
       case 'd':
-      case '\r':
         component.onOpen(AppScreen.doctor);
         return true;
       case 'p':
@@ -121,18 +156,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text(
-              'webapp-kit $appVersion — isolated webapps',
+              'Cocoon $appVersion — isolated webapps',
               style: const TextStyle(
-                  fontWeight: FontWeight.bold, color: Colors.yellow),
+                fontWeight: FontWeight.bold,
+                color: Colors.yellow,
+              ),
             ),
             const SizedBox(height: 1),
             if (err != null)
-              Text('Error: $err\nPress r to retry, q to quit.',
-                  style: const TextStyle(color: Colors.brightRed))
+              Text(
+                'Error: $err\nPress r to retry, q to quit.',
+                style: const TextStyle(color: Colors.brightRed),
+              )
             else if (items == null)
               const Text('Loading…')
             else if (items.isEmpty)
-              const Text('No webapps installed.\nPress c to create one, ? for help.')
+              const Text(
+                'No webapps installed.\nPress c to create one, ? for help.',
+              )
             else
               Expanded(
                 child: ListView(
@@ -143,9 +184,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ],
                 ),
               ),
+            if (notice != null)
+              Text(
+                notice!,
+                style: TextStyle(
+                  color: noticeOk ? Colors.green : Colors.brightRed,
+                ),
+              ),
             const SizedBox(height: 1),
             const Text(
-              'c create · x remove · d doctor · p probe · ? help · r refresh · q quit',
+              'Enter open · c create · x remove · d doctor · p probe · '
+              '? help · r refresh · q quit',
               style: TextStyle(color: Colors.brightBlack),
             ),
           ],
@@ -164,8 +213,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           : null,
       child: Text(
         '${isSelected ? '>' : ' '} $line',
-        style: TextStyle(
-            color: isSelected ? Colors.brightWhite : Colors.white),
+        style: TextStyle(color: isSelected ? Colors.brightWhite : Colors.white),
       ),
     );
   }

@@ -1,10 +1,10 @@
-/// Data models parsed from the webapp-* CLI `--json` output.
+/// Data models parsed from the unified `cocoon` CLI `--json` output.
 /// Pure functions only — no I/O, fully unit-testable.
 library;
 
 import 'dart:convert';
 
-/// One installed webapp (from `webapp-list --json`).
+/// One installed webapp (from `cocoon list --json`).
 class WebApp {
   final String name;
   final String engine;
@@ -19,17 +19,17 @@ class WebApp {
   });
 
   factory WebApp.fromJson(Map<String, dynamic> json) => WebApp(
-        name: (json['name'] ?? '').toString(),
-        engine: (json['engine'] ?? 'custom').toString(),
-        url: (json['url'] ?? '').toString(),
-        desktop: (json['desktop'] ?? '').toString(),
-      );
+    name: (json['name'] ?? '').toString(),
+    engine: (json['engine'] ?? 'custom').toString(),
+    url: (json['url'] ?? '').toString(),
+    desktop: (json['desktop'] ?? '').toString(),
+  );
 
   @override
   String toString() => 'WebApp($name, $engine, $url)';
 }
 
-/// Parse `webapp-list --json` (a top-level JSON array).
+/// Parse `cocoon list --json` (a top-level JSON array).
 List<WebApp> parseAppList(String text) {
   final decoded = jsonDecode(text);
   if (decoded is! List) {
@@ -41,7 +41,7 @@ List<WebApp> parseAppList(String text) {
       .toList();
 }
 
-/// One app entry inside `webapp-doctor --json`.
+/// One app entry inside `cocoon doctor --json`.
 class DoctorApp {
   final String name;
   final String engine;
@@ -62,21 +62,19 @@ class DoctorApp {
   });
 
   factory DoctorApp.fromJson(Map<String, dynamic> json) => DoctorApp(
-        name: (json['name'] ?? '').toString(),
-        engine: (json['engine'] ?? 'custom').toString(),
-        url: (json['url'] ?? '').toString(),
-        cssVersion: (json['css_version'] ?? 'n/a').toString(),
-        live: json['live'] == true,
-        kwinRule: json['kwin_rule'] == true,
-        issues: ((json['issues'] as List?) ?? [])
-            .map((e) => e.toString())
-            .toList(),
-      );
+    name: (json['name'] ?? '').toString(),
+    engine: (json['engine'] ?? 'custom').toString(),
+    url: (json['url'] ?? '').toString(),
+    cssVersion: (json['css_version'] ?? 'n/a').toString(),
+    live: json['live'] == true,
+    kwinRule: json['kwin_rule'] == true,
+    issues: ((json['issues'] as List?) ?? []).map((e) => e.toString()).toList(),
+  );
 
   bool get healthy => issues.isEmpty;
 }
 
-/// Full `webapp-doctor --json` report.
+/// Full `cocoon doctor --json` report.
 class DoctorReport {
   final List<DoctorApp> apps;
   final List<String> orphans;
@@ -94,9 +92,9 @@ class DoctorReport {
     return DoctorReport(
       apps: appsJson is List
           ? appsJson
-              .whereType<Map<String, dynamic>>()
-              .map(DoctorApp.fromJson)
-              .toList()
+                .whereType<Map<String, dynamic>>()
+                .map(DoctorApp.fromJson)
+                .toList()
           : const [],
       orphans: orphansJson is List
           ? orphansJson.map((e) => e.toString()).toList()
@@ -106,7 +104,7 @@ class DoctorReport {
   }
 }
 
-/// Parse `webapp-doctor --json` (a top-level JSON object).
+/// Parse `cocoon doctor --json` (a top-level JSON object).
 DoctorReport parseDoctorReport(String text) {
   final decoded = jsonDecode(text);
   if (decoded is! Map<String, dynamic>) {
@@ -115,13 +113,14 @@ DoctorReport parseDoctorReport(String text) {
   return DoctorReport.fromJson(decoded);
 }
 
-/// One installed browser (from `webapp-browsers --json`).
+/// One installed browser (from `cocoon browsers --json`).
 class Browser {
   final String id;
   final String engine;
   final String name;
   final String version;
   final bool supported;
+  final String source;
 
   const Browser({
     required this.id,
@@ -129,15 +128,17 @@ class Browser {
     required this.name,
     required this.version,
     required this.supported,
+    this.source = 'path',
   });
 
   factory Browser.fromJson(Map<String, dynamic> json) => Browser(
-        id: (json['id'] ?? json['bin'] ?? '').toString(),
-        engine: (json['engine'] ?? '').toString(),
-        name: (json['name'] ?? '').toString(),
-        version: (json['version'] ?? '').toString(),
-        supported: json['supported'] != false,
-      );
+    id: (json['id'] ?? json['bin'] ?? '').toString(),
+    engine: (json['engine'] ?? '').toString(),
+    name: (json['name'] ?? '').toString(),
+    version: (json['version'] ?? '').toString(),
+    supported: json['supported'] != false,
+    source: (json['source'] ?? 'path').toString(),
+  );
 
   /// Label for picker rows, e.g. "Vivaldi (vivaldi-stable) [chromium] 7.1".
   String get label {
@@ -149,8 +150,8 @@ class Browser {
   String toString() => 'Browser($id, $engine)';
 }
 
-/// Parse `webapp-browsers --json` (a top-level JSON array).
-/// Flatpak list-only rows (supported=false) are kept — callers filter.
+/// Parse `cocoon browsers --json` (a top-level JSON array).
+/// Flatpak rows carry launchable `flatpak:<app-id>` ids with source=flatpak.
 List<Browser> parseBrowserList(String text) {
   final decoded = jsonDecode(text);
   if (decoded is! List) {
@@ -162,11 +163,11 @@ List<Browser> parseBrowserList(String text) {
       .toList();
 }
 
-/// Only browsers that can actually back a webapp (native installs).
+/// Only browsers that can actually back a webapp (native or Flatpak).
 List<Browser> supportedBrowsers(List<Browser> browsers) =>
     browsers.where((b) => b.supported && b.id.isNotEmpty).toList();
 
-/// Mirror of the bash slugify() in webapp-* (spaces to dashes, keep
+/// Mirror of the bash slugify() in cocoon (spaces to dashes, keep
 /// alnum/dash/underscore/dot, collapse + trim dashes). Used for probe
 /// MATCH highlighting only.
 String slugifyApp(String name) {
@@ -177,7 +178,7 @@ String slugifyApp(String name) {
   return s.isEmpty ? 'webapp' : s;
 }
 
-/// One streamed probe line (`webapp-doctor --probe` output).
+/// One streamed probe line (`cocoon doctor --probe` output).
 class ProbeSample {
   /// Window identity (Wayland app_id / WM class), if parseable.
   final String? klass;

@@ -10,10 +10,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: bash syntax (scripts only; never the compiled binary)
-        run: bash -n bin/webapp-* install.sh tool/*.sh
-      - name: version consistency (VERSION file vs pubspec literal)
+        run: bash -n bin/cocoon libexec/* install.sh tool/*
+      - name: version consistency (VERSION, pubspec, tag when tagged)
         run: |
-          test "$(cat VERSION)" = "$(sed -n 's/^version: //p' tui/pubspec.yaml)"
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+            tool/version.sh --check "${GITHUB_REF_NAME}"
+          else
+            tool/version.sh --check
+          fi
+      - name: legacy data path fallback tests
+        run: bash tool/test-paths.sh
+      - name: custom browser binary tests
+        run: bash tool/test-browsers.sh
+      - name: flatpak browser launch tests
+        run: bash tool/test-flatpak.sh
 
   dart:
     runs-on: ubuntu-latest
@@ -22,10 +33,34 @@ jobs:
       - uses: dart-lang/setup-dart@v1
       - name: dependencies
         working-directory: tui
-        run: dart pub get
+        run: dart pub get --enforce-lockfile
+      - name: format
+        working-directory: tui
+        run: dart format --set-exit-if-changed .
       - name: analyze
         working-directory: tui
         run: dart analyze
       - name: tests
         working-directory: tui
         run: dart test
+      - name: compile and smoke run cocoon-tui
+        working-directory: tui
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          entries=(bin/*tui.dart)
+          if [ "${#entries[@]}" -ne 1 ]; then
+            echo "expected exactly one TUI entry point, found ${#entries[@]}" >&2
+            exit 1
+          fi
+          dart compile exe -DAPP_VERSION="$(cat ../VERSION)" "${entries[0]}" -o cocoon-tui
+          set +e
+          timeout 10s ./cocoon-tui --help >cocoon-tui.smoke 2>&1
+          rc=$?
+          set -e
+          cat cocoon-tui.smoke
+          test -f cocoon-tui.smoke
+          case "$rc" in
+            0 | 124) ;;
+            *) echo "smoke run exited $rc (non-TTY environments are expected to fail fast)" >&2 ;;
+          esac

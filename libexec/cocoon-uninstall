@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# cocoon-uninstall — remove the Cocoon TOOLKIT (not a single cocoon).
+#
+# To delete ONE app, use: cocoon remove <name> (NOT this command).
+#
+#   cocoon uninstall            remove toolkit code, KEEP all app data
+#   cocoon uninstall --purge    remove toolkit code AND every app
+#                               (desktop, icon, KWin rule, isolated data)
+#   cocoon uninstall [--purge] --yes   skip confirmation (for scripts)
+#
+# Never touched: your main browser profiles, system packages, repo clones.
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+PURGE=false
+YES=false
+
+usage() {
+  echo "Usage: cocoon uninstall [--purge] [--yes]"
+  echo ""
+  echo "Removes the Cocoon toolkit itself."
+  echo "To delete a single app instead: cocoon remove <name>"
+}
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case "$SELF_DIR" in
+  */bin | */libexec) PREFIX="$(dirname "$SELF_DIR")" ;;
+  *) PREFIX="$HOME/.local/share/cocoon" ;;
+esac
+BIN_DST="$PREFIX/bin"
+
+# Source-only path helper (stdout-silent). The legacy prefix is consulted ONLY
+# for version detection below; all removal targets stay self-relative/new.
+# shellcheck disable=SC1090
+source "$SELF_DIR/cocoon-paths.sh" 2>/dev/null || true
+
+cmd_version() {
+  local legacy="$HOME/.local/share/webapps" p
+  if [[ -f "$PREFIX/VERSION" ]]; then
+    cat "$PREFIX/VERSION"
+    return 0
+  fi
+  if declare -F cocoon_legacy_data_root >/dev/null 2>&1; then
+    p="$(cocoon_legacy_data_root 2>/dev/null || true)"
+    [[ -n "$p" ]] && legacy="$p"
+  fi
+  if [[ -f "$legacy/VERSION" ]]; then
+    cat "$legacy/VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --purge) PURGE=true; shift ;;
+    --yes | -y) YES=true; shift ;;
+    -h | --help) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
+    -*)
+      echo "cocoon-uninstall: unknown flag: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      # Guardrail: a bare name almost certainly means "delete this cocoon".
+      if [[ -x "$PREFIX/libexec/cocoon-list" ]] &&
+        bash "$PREFIX/libexec/cocoon-list" 2>/dev/null | awk -v n="$1" 'index($0, n " ") == 1 { found = 1 } END { exit !found }'; then
+        echo "cocoon uninstall removes the Cocoon toolkit itself —" >&2
+        echo "did you mean: cocoon remove \"$1\" ?" >&2
+        exit 1
+      fi
+      echo "cocoon uninstall takes no app names (did you mean 'cocoon remove'?)." >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Collect purge targets BEFORE deleting anything (helpers live in libexec/).
+PURGE_APPS=()
+if [[ "$PURGE" == "true" && -x "$PREFIX/libexec/cocoon-list" ]]; then
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && PURGE_APPS+=("$line")
+  done < <(bash "$PREFIX/libexec/cocoon-list" 2>/dev/null | awk 'NR>1 && NF {print $1}' || true)
+fi
+
+echo "cocoon-uninstall will remove the Cocoon toolkit:"
+echo "  - code:            $BIN_DST"
+echo "  - link-router ext: $PREFIX/ext (+ its browser native-host manifests)"
+echo "  - shell PATH lines pointing at it"
+echo "  - Plasma session PATH file (if ours)"
+if [[ "$PURGE" == "true" ]]; then
+  echo "  - EVERY cocoon and its isolated data:"
+  if ((${#PURGE_APPS[@]} == 0)); then
+    echo "      (none installed)"
+  else
+    for a in "${PURGE_APPS[@]}"; do echo "      - $a"; done
+  fi
+else
+  echo "KEPT (your apps keep working until removed): profiles, desktops,"
+  echo "icons, KWin rules. Delete one app with: cocoon remove <name>"
+fi
+
+if [[ "$YES" != "true" ]]; then
+  if [[ "$PURGE" == "true" ]]; then
+    printf 'Wipe EVERYTHING irreversibly? [y/N]> '
+  else
+    printf 'Delete toolkit but keep my apps? [y/N]> '
+  fi
+  IFS= read -r answer || answer=""
+  case "$answer" in
+    y | Y | yes | YES) ;;
+    *)
+      echo "Aborted."
+      exit 1
+      ;;
+  esac
+fi
+
+# 1. Per-app purge while helpers still exist.
+if [[ "$PURGE" == "true" && -x "$PREFIX/libexec/cocoon-remove" ]]; then
+  for a in ${PURGE_APPS[@]+"${PURGE_APPS[@]}"}; do
+    bash "$PREFIX/libexec/cocoon-remove" --purge "$a" >/dev/null 2>&1 || true
+  done
+fi
+
+# 2. Toolkit code + version stamp + link-router extension.
+rm -rf "$BIN_DST" "$PREFIX/libexec" "$PREFIX/ext"
+rm -f "$PREFIX/VERSION"
+
+# 2b. Link-router native-host manifests (exact filenames, ours only). Covers
+# host ~/.config and each Flatpak sandbox's ~/.var/app/<app-id>/config tree;
+# never delete any other browser/profile data.
+for _root in "$HOME/.config" "$HOME/.var/app"; do
+  [[ -d "$_root" ]] || continue
+  while IFS= read -r -d '' _m; do rm -f "$_m"; done < <(
+    find "$_root" -maxdepth 8 -type f \
+      \( -name 'com.cocoon.open_external.json' -o -name 'com.webappkit.open_external.json' \) \
+      -print0 2>/dev/null || true
+  )
+done
+
+# 3. Shell PATH lines (exactly ours).
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  [[ -f "$rc" ]] || continue
+  tmp="$(mktemp "${rc}.cocoon.XXXXXX")" || continue
+  grep -v -F -e "$BIN_DST:" -e ".local/share/cocoon/bin:" -e ".local/share/webapps/bin:" "$rc" >"$tmp" || true
+  mv -f "$tmp" "$rc"
+done
+
+# 3b. Fish config (own syntax; lines carry the bare path, no colon).
+# Removal takes the whole marked block: leaving a bare `end` behind would
+# be a fish syntax error.
+FISH_CONF="$HOME/.config/fish/config.fish"
+if [[ -f "$FISH_CONF" ]]; then
+  tmp="$(mktemp "${FISH_CONF}.cocoon.XXXXXX")" || true
+  if [[ -n "${tmp:-}" ]] && grep -q '^# cocoon: managed by install.sh$' "$FISH_CONF" &&
+    grep -q '^# /cocoon$' "$FISH_CONF"; then
+    sed '/^# cocoon: managed by install.sh$/,/^# \/cocoon$/d' "$FISH_CONF" >"$tmp" || true
+  else
+    grep -v -F -e "$BIN_DST" "$FISH_CONF" >"$tmp" || true
+  fi
+  [[ -n "${tmp:-}" ]] && mv -f "$tmp" "$FISH_CONF"
+  if ! grep -q '[^[:space:]]' "$FISH_CONF" 2>/dev/null; then rm -f "$FISH_CONF"; fi
+fi
+
+# 4. Plasma session PATH file (only if it is ours).
+ENV_FILE="$HOME/.config/plasma-workspace/env/cocoon-path.sh"
+if [[ -f "$ENV_FILE" ]] && grep -q "cocoon" "$ENV_FILE" 2>/dev/null; then
+  rm -f "$ENV_FILE"
+fi
+
+echo "Uninstalled Cocoon."
+if [[ "$PURGE" != "true" ]]; then
+  echo "Your apps and their data were kept."
+fi

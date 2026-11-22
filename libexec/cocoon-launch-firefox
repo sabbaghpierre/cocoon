@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# cocoon-launch-firefox — launch a URL in a self-contained (ice-ssb style)
+# Firefox profile with an app-like UI: tab strip removed, titlebar keeps only
+# the minimize/maximize/close buttons plus drag space.
+#
+# Isolation model (like ice-ssb, whose Firefox SSBs are ALWAYS isolated):
+#   firefox --profile ~/.local/share/cocoon/firefox-<slug> --no-remote <url>
+# The profile dir is app-owned: no profiles.ini bookkeeping, rm -rf purges it.
+# Any Gecko binary works here (firefox, firefox-esr, librewolf, zen-browser,
+# floorp, waterfox): same profile flags, same user.js/userChrome.css layout.
+# The concrete binary is pinned per-app via --browser (written by
+# cocoon-create from `cocoon-browsers` detection); omitting it means plain
+# `firefox` so pre-pinning .desktop files keep working.
+#
+# Wayland identity: --name sets the Wayland app_id, which must equal the slug
+# (and StartupWMClass in the .desktop). --class covers X11/XWayland.
+#
+# Usage:
+#   cocoon-launch-firefox --name "My App" --url "https://example.com" [--browser librewolf]
+#   cocoon-launch-firefox "https://example.com"
+#   A trailing URL-like positional (e.g. %u from a MimeType handler) overrides --url.
+set -euo pipefail
+
+# Never inherit a hostile field separator/glob config.
+unset IFS GLOBIGNORE
+
+# Shared data-path resolution (source-only, stdout-silent). Sourced gracefully:
+# old installs lacking cocoon-paths.sh keep the hardcoded default below.
+COCOON_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1090
+source "$COCOON_MODULE_DIR/cocoon-paths.sh" 2>/dev/null || true
+DATA_ROOT="$HOME/.local/share/cocoon"
+if declare -F cocoon_data_root >/dev/null 2>&1; then
+  _p="$(cocoon_data_root 2>/dev/null || true)"
+  [[ -n "$_p" ]] && DATA_ROOT="$_p"
+fi
+
+# --version source of truth: $PREFIX/VERSION shipped by install.sh.
+cmd_version() {
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$d/../VERSION" ]]; then
+    cat "$d/../VERSION"
+  else
+    printf 'dev'
+  fi
+}
+
+NAME=""
+URL=""
+BROWSER="firefox"
+BROWSER_PINNED=false
+EXTRA=()
+
+usage() {
+  echo "Usage: cocoon-launch-firefox --name \"My App\" --url \"https://example.com\" [--browser <id|path>]"
+  echo "       cocoon-browsers --list   # show valid --browser ids"
+}
+
+slugify() {
+  local s="$1"
+  s="${s// /-}"
+  s="$(printf '%s' "$s" | tr -c '[:alnum:]-_.' '-')"
+  s="$(printf '%s' "$s" | sed -e 's/-\{2,\}/-/g' -e 's/^[-.]//' -e 's/[-.]$//')"
+  [[ -z "$s" ]] && s="cocoon"
+  printf '%s' "$s"
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --name) NAME="${2:?--name needs a value}"; shift 2 ;;
+    --url) URL="${2:?--url needs a value}"; shift 2 ;;
+    --browser | --browser-bin) BROWSER="${2:?--browser needs a value}"; BROWSER_PINNED=true; shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$(basename "$0")" "$(cmd_version)"; exit 0 ;;
+    --) shift; while (($# > 0)); do EXTRA+=("$1"); shift; done; break ;;
+    --*) echo "cocoon-launch-firefox: unknown flag: $1" >&2; usage >&2; exit 1 ;;
+    *)
+      if [[ -z "$URL" ]]; then URL="$1"; else EXTRA+=("$1"); fi
+      shift
+      ;;
+  esac
+done
+
+if ((${#EXTRA[@]} > 0)); then
+  last="${EXTRA[${#EXTRA[@]} - 1]}"
+  if [[ "$last" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]]; then
+    URL="$last"
+    unset 'EXTRA[${#EXTRA[@]}-1]'
+  fi
+fi
+
+if [[ -z "$URL" ]]; then
+  echo "cocoon-launch-firefox: no URL given" >&2
+  usage >&2
+  exit 1
+fi
+if [[ ! "$URL" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]]; then
+  URL="https://$URL"
+fi
+
+if [[ -z "$NAME" ]]; then
+  host="${URL#*://}"
+  host="${host%%/*}"
+  NAME="$host"
+fi
+SLUG="$(slugify "$NAME")"
+
+BROWSERS_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cocoon-browsers"
+if [[ -f "$BROWSERS_HELPER" ]]; then
+  # shellcheck disable=SC1090
+  source "$BROWSERS_HELPER" 2>/dev/null || true
+fi
+# Refuse an obvious engine mismatch early (a Chromium binary here would fail
+# obscurely on --profile). Known ids are authoritative; for a custom path the
+# probe is only a safety guard — this launcher is already the firefox engine.
+_requested="$BROWSER"
+IS_FLATPAK=false
+LAUNCH=()
+if declare -F cocoon_browser_engine >/dev/null 2>&1; then
+  _beng="$(cocoon_browser_engine "$BROWSER" 2>/dev/null || true)"
+  if [[ -z "$_beng" ]] && declare -F cocoon_browser_is_path >/dev/null 2>&1 &&
+    cocoon_browser_is_path "$BROWSER"; then
+    _beng="$(cocoon_browser_probe_engine "$BROWSER" 2>/dev/null || true)"
+  fi
+  if [[ -n "$_beng" && "$_beng" != "firefox" ]]; then
+    echo "cocoon-launch-firefox: browser '$_requested' is a chromium-engine binary; use cocoon-launch-chrome for it" >&2
+    exit 1
+  fi
+fi
+
+if declare -F cocoon_browser_is_flatpak >/dev/null 2>&1 && cocoon_browser_is_flatpak "$BROWSER"; then
+  # Flatpak: build `flatpak run --filesystem=... [--env=...] <app-id>` as an
+  # argv array. The helper injects MOZ_ENABLE_WAYLAND inside the sandbox, so
+  # the host-side `env ...` prefix below must not be used here.
+  IS_FLATPAK=true
+  if ! command -v flatpak >/dev/null 2>&1; then
+    echo "cocoon-launch-firefox: flatpak is not installed (needed for '$_requested')" >&2
+    exit 1
+  fi
+  _app="$(cocoon_browser_flatpak_app "$BROWSER" 2>/dev/null || true)"
+  if [[ -z "$_app" ]] || ! declare -F cocoon_browser_launch_argv >/dev/null 2>&1; then
+    echo "cocoon-launch-firefox: invalid flatpak browser id '$_requested'" >&2
+    exit 1
+  fi
+  if declare -F cocoon_browser_flatpak_installed >/dev/null 2>&1 &&
+    ! cocoon_browser_flatpak_installed "$_app"; then
+    echo "cocoon-launch-firefox: flatpak app '$_app' is not installed" >&2
+    exit 1
+  fi
+  mapfile -t LAUNCH < <(cocoon_browser_launch_argv "$BROWSER" "$DATA_ROOT" 2>/dev/null || true)
+  if ((${#LAUNCH[@]} == 0)); then
+    echo "cocoon-launch-firefox: could not build the flatpak launch command for '$_requested'" >&2
+    exit 1
+  fi
+  _RESOLVED="$BROWSER"
+else
+  # Resolve ids AND custom paths (with spaces) to an absolute executable.
+  _RESOLVED=""
+  if declare -F cocoon_browser_resolve >/dev/null 2>&1; then
+    _RESOLVED="$(cocoon_browser_resolve "$BROWSER" 2>/dev/null || true)"
+  elif [[ "$BROWSER" == */* ]]; then
+    [[ -f "$BROWSER" && -x "$BROWSER" ]] && _RESOLVED="$BROWSER" || true
+  else
+    command -v "$BROWSER" >/dev/null 2>&1 && _RESOLVED="$BROWSER" || true
+  fi
+  if [[ -z "$_RESOLVED" ]]; then
+    if [[ "$BROWSER_PINNED" == "true" ]]; then
+      echo "cocoon-launch-firefox: pinned browser '$_requested' not found (not an executable file or PATH command)" >&2
+    else
+      echo "cocoon-launch-firefox: firefox not found on PATH" >&2
+    fi
+    echo "  Run 'cocoon-browsers' to list installed browsers." >&2
+    if [[ "$_requested" == "librewolf" ]]; then
+      echo "  Note: LibreWolf clears cookies/history aggressively by default;" >&2
+      echo "  an isolated cocoon may forget logins unless you relax that." >&2
+    fi
+    exit 1
+  fi
+  BROWSER="$_RESOLVED"
+fi
+
+PDIR="$DATA_ROOT/firefox-${SLUG}"
+# Reuse an existing profile from the legacy root when that is where the user's
+# logins live; never create new data there (a missing dir resolves to new root).
+if declare -F cocoon_find_profile >/dev/null 2>&1; then
+  _p="$(cocoon_find_profile firefox "$SLUG" 2>/dev/null || true)"
+  [[ -n "$_p" ]] && PDIR="$_p"
+fi
+# Logs are always written to the canonical (new) root.
+LOG_FILE="$DATA_ROOT/${SLUG}.log"
+
+# Keep per-app logs bounded (append-only otherwise). Keep last ~500 lines.
+_cocoon_log_rotate() { # $1=file [max_bytes=262144]
+  local f="$1" max="${2:-262144}" sz
+  [[ -f "$f" ]] || return 0
+  sz="$(wc -c <"$f" 2>/dev/null || printf 0)"
+  [[ "$sz" =~ ^[0-9]+$ ]] || return 0
+  ((sz > max)) || return 0
+  local rot
+  rot="$(mktemp "${f}.cocoon.XXXXXX" 2>/dev/null)" || return 0
+  if tail -n 500 "$f" >"$rot" 2>/dev/null && mv -f "$rot" "$f" 2>/dev/null; then
+    :
+  else
+    rm -f "$rot" 2>/dev/null || true
+    : >"$f" 2>/dev/null || true
+  fi
+}
+log() {
+  _cocoon_log_rotate "$LOG_FILE"
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+mkdir -p "$PDIR/chrome"
+log "launch name='$NAME' slug='$SLUG' url='$URL' browser='$BROWSER' profile='$PDIR' extra='${EXTRA[*]:-}'"
+
+# stylesheets pref (idempotent)
+PREF='user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);'
+touch "$PDIR/user.js"
+if ! grep -qF 'toolkit.legacyUserProfileCustomizations.stylesheets' "$PDIR/user.js"; then
+  printf '%s\n' "$PREF" >>"$PDIR/user.js"
+  log "enabled userChrome stylesheets pref"
+fi
+
+# minimal UI stylesheet: v3 keeps window controls, strips tab strip contents.
+CSS="$PDIR/chrome/userChrome.css"
+write_v3_css() {
+  cat >"$1" <<'EOF'
+/* cocoon minimal UI v3 — auto-generated by cocoon-launch-firefox; safe to edit */
+/* Titlebar keeps ONLY window controls + drag space. #TabsToolbar itself must
+   stay visible: on Linux CSD the min/max/close buttons live inside it. */
+#TabsToolbar > *:not(.titlebar-buttonbox-container):not(.titlebar-spacer) {
+  display: none !important;
+}
+#tabbrowser-tabs,
+#tabbrowser-arrowscrollbox,
+#alltabs-button,
+#new-tab-button,
+#tabs-newtab-button {
+  display: none !important;
+}
+/* Browser chrome we never want in app mode (nav-bar holds the hamburger
+   menu and extension buttons, so hiding it removes those too). */
+#nav-bar,
+#PersonalToolbar,
+#statuspanel,
+#sidebar-box,
+#sidebar-header {
+  visibility: collapse !important;
+}
+/* popup-reveal v1: permission doorhangers anchor inside #nav-bar, so reveal
+   it while hovered, keyboard-focused, or while any arrow panel (e.g. the
+   doorhanger itself) is open — otherwise prompts misposition into an
+   unclickable loop. Sibling order mainPopupSet→toolbox and panelopen-on-
+   arrow-panels both verified against this Firefox build's DOM. Hover the
+   top edge and click Allow once; the grant ends any retry loop for good. */
+#navigator-toolbox:is(:hover, :focus-within) #nav-bar,
+#mainPopupSet:hover ~ #navigator-toolbox #nav-bar,
+#mainPopupSet:has(> [panelopen]) ~ #navigator-toolbox #nav-bar {
+  visibility: visible !important;
+}
+:root[sizemode="normal"] #toolbar-menubar {
+  visibility: collapse !important;
+}
+#toolbar-menubar[autohide="false"] {
+  visibility: visible !important;
+}
+EOF
+}
+if [[ ! -f "$CSS" ]]; then
+  write_v3_css "$CSS"
+  log "wrote minimal-UI v3 css"
+elif ! grep -q 'popup-reveal v1' "$CSS"; then
+  if grep -q 'auto-generated by cocoon-launch-firefox' "$CSS"; then
+    cp -f "$CSS" "$CSS.cocoon-bak" || true
+    write_v3_css "$CSS"
+    log "migrated css to v3+popup-reveal (backup at $CSS.cocoon-bak)"
+  else
+    log "custom userChrome.css detected; left untouched"
+  fi
+fi
+
+# Warn (don't abort) when another Firefox instance already holds this
+# profile: the new window may fail or skip fresh settings, and the error
+# would otherwise vanish behind setsid. (pgrep never matches itself.)
+if command -v pgrep >/dev/null 2>&1 && pgrep -f -- "--profile $PDIR" >/dev/null 2>&1; then
+  echo "cocoon-launch-firefox: warning: profile $PDIR looks already in use;" >&2
+  echo "  close that Firefox window first or this launch may fail silently." >&2
+  log "warning: profile already in use"
+fi
+
+# --no-remote allows this profile to run alongside the default Firefox
+# instance. Force native Wayland ONLY when a Wayland compositor is actually in
+# use: under XWayland the window can push its own icon, overriding .desktop,
+# but setting MOZ_ENABLE_WAYLAND on a pure X11 session can prevent launch.
+# Flatpak already carries --env=MOZ_ENABLE_WAYLAND=1 in LAUNCH (helper-side),
+# so it needs no host-side env prefix here.
+if [[ "$IS_FLATPAK" != "true" ]]; then
+  FIREFOX_ENV=(setsid)
+  if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    FIREFOX_ENV=(env MOZ_ENABLE_WAYLAND=1 setsid)
+  fi
+  LAUNCH=("${FIREFOX_ENV[@]}" "$_RESOLVED")
+fi
+log "exec: ${LAUNCH[*]} --no-remote --profile $PDIR --new-window --name $SLUG --class $SLUG $URL ${EXTRA[*]:-}"
+exec "${LAUNCH[@]}" --no-remote --profile "$PDIR" --new-window --name "$SLUG" --class "$SLUG" "$URL" "${EXTRA[@]}"

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# cocoon - unified command line interface for isolated web apps.
+#
+# Usage: cocoon <command> [args...]
+#
+#   create               create a new isolated web app
+#   list                 list installed web apps (--json supported)
+#   open <name>          launch an installed web app by name
+#   remove [--purge] ... remove web apps (--purge also deletes profiles)
+#   doctor [name]        health check (--deps, --probe, --json supported)
+#   probe [name]         alias for `cocoon doctor --probe`
+#   browsers             list detectable browsers (--json supported)
+#   launch <engine>      internal: launcher used by generated .desktop files
+#   edit <name>          edit an app in place (URL, browser, icon, MIME)
+#   icon <name>          refresh an app's icon
+#   config               show or set defaults
+#   update [--check]     update the Cocoon toolkit
+#   uninstall [--purge]  remove the toolkit (--purge also removes all web apps)
+#   help                 show the full overview
+#
+# Every command is implemented in libexec/cocoon-<command>; this dispatcher only
+# resolves paths and routes arguments.
+set -euo pipefail
+unset IFS GLOBIGNORE
+
+SELF="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  RESOLVED="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+else
+  RESOLVED="$SELF"
+fi
+BIN_DIR="$(cd "$(dirname "$RESOLVED")" && pwd)"
+PREFIX="$(cd "$BIN_DIR/.." && pwd)"
+LIBEXEC="${COCOON_LIBEXEC:-$PREFIX/libexec}"
+export COCOON_PREFIX="$PREFIX" COCOON_LIBEXEC="$LIBEXEC"
+
+die() { printf 'cocoon: %s\n' "$*" >&2; exit 1; }
+
+version() {
+  if [[ -f "$PREFIX/VERSION" ]]; then cat "$PREFIX/VERSION"; else printf 'dev'; fi
+}
+
+run() {
+  local module="$1"
+  shift
+  [[ -f "$LIBEXEC/cocoon-$module" ]] || die "missing module '$module' (reinstall Cocoon)"
+  exec bash "$LIBEXEC/cocoon-$module" "$@"
+}
+
+# Native messaging host: Chrome invokes the manifest `path` with the extension
+# origin as argv[1]. Route that straight to the host module.
+case "${1:-}" in
+  chrome-extension://*) run open-external "$@" ;;
+esac
+
+case "${1:-}" in
+  '' | -h | --help | help) run help "${@:2}" ;;
+  -V | --version) printf 'cocoon %s\n' "$(version)"; exit 0 ;;
+  create | list | remove | browsers | update | uninstall | help | edit | icon | config | open-external)
+    run "$1" "${@:2}"
+    ;;
+  doctor)
+    run doctor "${@:2}"
+    ;;
+  probe)
+    run doctor --probe "${@:2}"
+    ;;
+  open)
+    run open "${@:2}"
+    ;;
+  launch)
+    engine="${2:-}"
+    shift $(( $# > 1 ? 2 : 1 ))
+    case "$engine" in
+      chrome | chromium) run launch-chrome "$@" ;;
+      firefox | ff) run launch-firefox "$@" ;;
+      '') die "launch needs an engine: cocoon launch chrome|firefox ..." ;;
+      *) die "unknown engine '$engine' (use chrome or firefox)" ;;
+    esac
+    ;;
+  *)
+    die "unknown command '$1' (try 'cocoon help')"
+    ;;
+esac

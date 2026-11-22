@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# webapp-kwin.sh — shared KDE/KWin helpers for the webapp-* scripts.
-# Sourced (not executed) by webapp-create / webapp-remove.
+# cocoon-kwin.sh — shared KDE/KWin helpers for the cocoon-* scripts.
+# Sourced (not executed) by cocoon-create / cocoon-remove.
 #
 # Background: Chromium ignores --class when --app= is set, so --app windows
 # report Chromium's derived identity (chrome-<host>__-Default style) instead
@@ -13,19 +13,26 @@
 
 KWIN_RULES_FILE="${HOME}/.config/kwinrulesrc"
 
-# webapp_chrome_id <url> — predict Chromium's window id for a --app window.
+# cocoon_chrome_id <url> — predict Chromium's window id for a --app window.
 # e.g. https://strafe.com/ -> chrome-strafe.com__-Default
-webapp_chrome_id() {
+cocoon_chrome_id() {
   local host="${1#*://}"
-  host="${host%%/*}"
-  host="${host%%:*}" # strip port
+  host="${host%%\?*}"                 # strip query
+  host="${host%%#*}"                  # strip fragment
+  host="${host%%/*}"                  # strip path
+  host="${host##*@}"                  # strip userinfo
+  if [[ "$host" == \[*\]* ]]; then
+    host="${host#\[}"; host="${host%%\]*}"   # IPv6 literal
+  else
+    host="${host%%:*}"                 # strip port
+  fi
   host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
-  [[ -z "$host" ]] && host="webapp"
+  [[ -z "$host" ]] && host="cocoon"
   printf 'chrome-%s__-Default' "$host"
 }
 
-# webapp_regex_escape <string> — escape for KWin regexp match (wmclassmatch=3).
-webapp_regex_escape() {
+# cocoon_regex_escape <string> — escape for KWin regexp match (wmclassmatch=3).
+cocoon_regex_escape() {
   printf '%s' "$1" | sed 's/[][\.*^$()+?{}|\\]/\\&/g'
 }
 
@@ -43,7 +50,7 @@ kwin_reconfigure() {
 
 _kwin_backup() {
   if [[ -f "$KWIN_RULES_FILE" ]]; then
-    cp -f "$KWIN_RULES_FILE" "$KWIN_RULES_FILE.webapp-bak" || true
+    cp -f "$KWIN_RULES_FILE" "$KWIN_RULES_FILE.cocoon-bak" || true
   fi
 }
 
@@ -56,7 +63,7 @@ kwin_rule_exists() {
   # NOTE: via ENVIRON, not -v: awk -v unescapes backslashes, ENVIRON doesn't.
   KWEX_T="$target" KWEX_P="$pattern_esc" awk '
     /^\[.*\]$/ { g = substr($0, 2, length($0) - 2); desc[g] = ""; df[g] = ""; wm[g] = ""; next }
-    /^Description=webapp: / { desc[g] = $0; next }
+    /^Description=cocoon: / { desc[g] = $0; next }
     /^desktopfile=/ { df[g] = substr($0, 13); next }
     /^wmclass=/ { wm[g] = substr($0, 9); next }
     END {
@@ -72,21 +79,25 @@ kwin_rule_exists() {
 kwin_rule_add() {
   local desktop_id="$1" app_name="$2" pattern="$3"
   command -v kwriteconfig6 >/dev/null 2>&1 || {
-    echo "webapp: warning: kwriteconfig6 not found; skipping KWin rule" >&2
+    echo "cocoon: warning: kwriteconfig6 not found; skipping KWin rule" >&2
     return 0
   }
   if kwin_rule_exists "$desktop_id" "$pattern"; then
     echo "  KWin rule already present for '$app_name'"
     return 0
   fi
+  # Recreating an app with a changed URL produces a different regex. Drop any
+  # previous rule for this desktop id first, otherwise rules accumulate and
+  # the doctor reports duplicates forever.
+  kwin_rule_remove "$desktop_id" >/dev/null 2>&1 || true
   _kwin_backup
   local uuid
-  uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "webapp-$RANDOM-$RANDOM")"
-  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key Description "webapp: $app_name" || return 0
-  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key desktopfile "$desktop_id"
-  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key desktopfilerule 4
-  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key wmclass "$pattern"
-  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key wmclassmatch 3
+  uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "cocoon-$RANDOM-$RANDOM")"
+  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key Description "cocoon: $app_name" || return 0
+  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key desktopfile "$desktop_id" || return 0
+  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key desktopfilerule 4 || return 0
+  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key wmclass "$pattern" || return 0
+  kwriteconfig6 --file kwinrulesrc --group "$uuid" --key wmclassmatch 3 || return 0
   # Register in [General].
   local rules="" count=""
   if command -v kreadconfig6 >/dev/null 2>&1; then
@@ -101,13 +112,13 @@ kwin_rule_add() {
     rules="$rules,$uuid"
   fi
   count=$((count + 1))
-  kwriteconfig6 --file kwinrulesrc --group General --key rules "$rules"
-  kwriteconfig6 --file kwinrulesrc --group General --key count "$count"
+  kwriteconfig6 --file kwinrulesrc --group General --key rules "$rules" || return 0
+  kwriteconfig6 --file kwinrulesrc --group General --key count "$count" || return 0
   echo "  KWin rule added for '$app_name' (match: $pattern)"
 }
 
 # kwin_rule_remove <desktop-id> — delete OUR rule groups for a desktop id.
-# Only touches groups whose Description starts with "webapp: ".
+# Only touches groups whose Description starts with "cocoon: ".
 kwin_rule_remove() {
   local target="$1"
   [[ -f "$KWIN_RULES_FILE" ]] || return 0
@@ -119,7 +130,7 @@ kwin_rule_remove() {
       next
     }
     g == "" { next }
-    /^Description=webapp: / { desc[g] = $0; next }
+    /^Description=cocoon: / { desc[g] = $0; next }
     /^desktopfile=/ { df[g] = substr($0, 13); next }
     END {
       n = 0
@@ -132,6 +143,8 @@ kwin_rule_remove() {
   ' "$KWIN_RULES_FILE")"
   [[ -z "$doomed" ]] && return 0
   _kwin_backup
+  local tmp
+  tmp="$(mktemp "${KWIN_RULES_FILE}.cocoon.XXXXXX" 2>/dev/null)" || return 0
   local n_removed=0
   n_removed="$(printf '%s' "$doomed" | wc -w)"
   # Snapshot General list from the ORIGINAL file before filtering.
@@ -209,8 +222,8 @@ kwin_rule_remove() {
       }
       flush_pending()
     }
-  ' "$KWIN_RULES_FILE" >"$KWIN_RULES_FILE.webapp-tmp" || return 0
-  cat "$KWIN_RULES_FILE.webapp-tmp" >"$KWIN_RULES_FILE"
-  rm -f "$KWIN_RULES_FILE.webapp-tmp"
+  ' "$KWIN_RULES_FILE" >"$tmp" || { rm -f "$tmp" 2>/dev/null || true; return 0; }
+  chmod --reference="$KWIN_RULES_FILE" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$KWIN_RULES_FILE" || { rm -f "$tmp" 2>/dev/null || true; return 0; }
   echo "  KWin rule removed for '$target'"
 }

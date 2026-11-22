@@ -1,50 +1,62 @@
 #!/usr/bin/env bash
-# webapp-open-external — native-messaging host for the link-router extension.
+# cocoon-open-external — native-messaging host for the link-router extension.
 #
-# The companion extension (ext/open-external, loaded by webapp-launch-chrome
+# The companion extension (ext/open-external, loaded by cocoon-launch-chrome
 # via --load-extension) sends {"url": "..."} for every link activated inside
-# an isolated webapp window. This host hands the URL to the SYSTEM DEFAULT
-# browser via xdg-open, so webapp windows never absorb external navigation.
+# an isolated cocoon window. This host hands the URL to the SYSTEM DEFAULT
+# browser via xdg-open, so cocoon windows never absorb external navigation.
 #
 # Protocol: Chrome native messaging over stdio (4-byte LE length + JSON both
 # ways). Pure bash + coreutils (no python needed). Never emits anything
 # except framed replies on stdout; diagnostics go to a log file.
 #
 # Started by Chrome (manifest path passed as argv[1], ignored); also runnable
-# by hand for testing: printf message | webapp-open-external.
+# by hand for testing: printf message | cocoon-open-external.
 set -euo pipefail
 
 # Never inherit a hostile field separator/glob config.
 unset IFS GLOBIGNORE
 
-DATA_ROOT="$HOME/.local/share/webapps"
+# Source-only helper; it MUST emit no stdout (binary native-messaging protocol).
+# Old installs lacking it keep the hardcoded default below.
+COCOON_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1090
+source "$COCOON_MODULE_DIR/cocoon-paths.sh" 2>/dev/null || true
+DATA_ROOT="$HOME/.local/share/cocoon"
+if declare -F cocoon_data_root >/dev/null 2>&1; then
+  _p="$(cocoon_data_root 2>/dev/null || true)"
+  [[ -n "$_p" ]] && DATA_ROOT="$_p"
+fi
 LOG_FILE="$DATA_ROOT/link-router.log"
 MAX_MSG=65536 # sanity cap on one native message
 mkdir -p "$DATA_ROOT" 2>/dev/null || true
 
 # Keep the log bounded (the host is launched per message; logs are append-only
 # otherwise). Keep the last ~500 lines once over the cap.
-_webapp_log_rotate() { # $1=file [max_bytes=262144]
+_cocoon_log_rotate() { # $1=file [max_bytes=262144]
   local f="$1" max="${2:-262144}" sz
   [[ -f "$f" ]] || return 0
   sz="$(wc -c <"$f" 2>/dev/null || printf 0)"
   [[ "$sz" =~ ^[0-9]+$ ]] || return 0
   ((sz > max)) || return 0
-  if tail -n 500 "$f" >"$f.rot" 2>/dev/null && mv -f "$f.rot" "$f" 2>/dev/null; then
+  local rot
+  rot="$(mktemp "${f}.cocoon.XXXXXX" 2>/dev/null)" || return 0
+  if tail -n 500 "$f" >"$rot" 2>/dev/null && mv -f "$rot" "$f" 2>/dev/null; then
     :
   else
+    rm -f "$rot" 2>/dev/null || true
     : >"$f" 2>/dev/null || true
   fi
 }
 
 log() {
-  _webapp_log_rotate "$LOG_FILE"
+  _cocoon_log_rotate "$LOG_FILE"
   printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true
 }
 
 case "${1:-}" in
   -h | --help)
-    echo "Usage: webapp-open-external   (Chrome native-messaging host; reads framed JSON on stdin)"
+    echo "Usage: cocoon-open-external   (Chrome native-messaging host; reads framed JSON on stdin)"
     echo "Opens {\"url\"} via xdg-open (system default browser). Only http(s) URLs are honored."
     exit 0
     ;;
@@ -103,7 +115,9 @@ while true; do
   fi
   msg="$(read_body "$len" || true)"
   [[ -n "$msg" ]] || break
-  url="$(printf '%s' "$msg" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | json_unescape_url || true)"
+  # Greedy-to-final-quote: a URL may contain JSON-escaped quotes (\"), which
+  # the old [^"]* pattern truncated before unescaping ever ran.
+  url="$(printf '%s' "$msg" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\(.*\)"[[:space:]]*[},].*$/\1/p' | head -n1 | json_unescape_url || true)"
   if [[ ! "$url" =~ ^[Hh][Tt][Tt][Pp][Ss]?:// ]]; then
     log "reject: not http(s): $(printf '%s' "$msg" | head -c 120)"
     reply '{"ok":false,"error":"not-http"}'
