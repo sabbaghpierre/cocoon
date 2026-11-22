@@ -4,6 +4,7 @@ library;
 import 'package:nocterm/nocterm.dart';
 
 import '../app.dart' show AppScreen;
+import '../branding.dart';
 import '../backend.dart';
 import '../models.dart';
 
@@ -155,6 +156,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            Text(
+              cocoonBannerLines.join('\n'),
+              style: const TextStyle(color: Colors.yellow),
+            ),
+            const SizedBox(height: 1),
             Text(
               'Cocoon $appVersion — isolated webapps',
               style: const TextStyle(

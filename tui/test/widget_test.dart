@@ -7,6 +7,7 @@ import 'package:cocoon_tui/backend.dart';
 import 'package:cocoon_tui/screens/create_form.dart';
 import 'package:cocoon_tui/screens/dashboard.dart';
 import 'package:cocoon_tui/screens/doctor_screen.dart';
+import 'package:cocoon_tui/screens/help_screen.dart';
 import 'package:cocoon_tui/screens/probe_screen.dart';
 import 'package:cocoon_tui/screens/remove_screen.dart';
 import 'package:nocterm/nocterm.dart';
@@ -98,6 +99,7 @@ void main() {
         );
         await tester.pump();
         expect(tester.terminalState, containsText('Cocoon dev'));
+        expect(tester.terminalState, containsText('o  o'));
         expect(tester.terminalState, containsText('Alpha'));
         await tester.pump();
         expect(tester.terminalState, containsText('> Alpha'));
@@ -474,6 +476,17 @@ void main() {
         expect(tester.terminalState, containsText('WARN Bad'));
         await tester.pump();
         expect(tester.terminalState, containsText('v1/v2'));
+      });
+    });
+  });
+
+  group('help screen', () {
+    test('renders the cocoon banner above the help text', () async {
+      await testNocterm('help banner', (tester) async {
+        await tester.pumpComponent(HelpScreen(onBack: () {}));
+        await tester.pump();
+        expect(tester.terminalState, containsText('o  o'));
+        expect(tester.terminalState, containsText('Cocoon help'));
       });
     });
   });

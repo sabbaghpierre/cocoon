@@ -3,6 +3,8 @@ library;
 
 import 'package:nocterm/nocterm.dart';
 
+import '../branding.dart';
+
 class HelpScreen extends StatelessComponent {
   final VoidCallback onBack;
 
@@ -11,6 +13,8 @@ class HelpScreen extends StatelessComponent {
   @override
   Component build(BuildContext context) {
     const lines = [
+      ...cocoonBannerLines,
+      '',
       'Cocoon help',
       '',
       'Dashboard keys:',

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/cocoon-128.png" alt="Cocoon" width="96">
+</p>
+
 # Cocoon
 
 Isolated webapps for any Linux distro and desktop: turn any website into a native-feeling app with its own icon, window, and isolated browser profile — no browser tabs, no shared logins. Cocoon is the successor to `webapp-kit`; everything is driven by a single `cocoon` command.
