@@ -1,6 +1,6 @@
 name: cocoon_tui
 description: Nocterm TUI frontend for the Cocoon isolated-webapps CLI.
-version: 0.1.0
+version: 0.1.1
 
 environment:
   sdk: ^3.13.0
